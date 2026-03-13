@@ -452,8 +452,9 @@ class BpmTimecodedBufferPipeline(Pipeline):
         if tap_tempo:
             self.tap_bpm()
 
-        if not video:
-            return {"video": [torch.zeros(1, 1, 1, 3, dtype=torch.uint8)]}
+        # Handle both list and tensor input, or empty
+        if isinstance(video, list) and len(video) == 0:
+            return {"video": torch.zeros(1, 1, 1, 3, dtype=torch.uint8)}
 
         # --- Test pattern override ---
         if test_input:
@@ -534,12 +535,11 @@ class BpmTimecodedBufferPipeline(Pipeline):
             preserve = 1.0 - mask_cpu
             display = (display + preserve * torch.tensor([0.0, 12.0, 0.0])).clamp(0.0, 255.0)
 
-        # Return as list of (1, H, W, C) uint8 tensors (same format Scope passes in)
+        # Return as (F, H, W, C) uint8 tensor — Scope calls output.shape[0]
         display_uint8 = display.to(torch.uint8)
-        video_out = [display_uint8[i:i+1] for i in range(F)]
 
         result = {
-            "video": video_out,
+            "video": display_uint8,
             "vace_input_frames": vace_frames,
             "vace_input_masks": vace_mask,
         }
@@ -845,8 +845,9 @@ class BpmTimecodeStripPipeline(Pipeline):
         """
         video = kwargs.get("video", [])
 
-        if not video:
-            return {"video": [torch.zeros(1, 1, 1, 3, dtype=torch.uint8)]}
+        # Handle both list and tensor input, or empty
+        if isinstance(video, list) and len(video) == 0:
+            return {"video": torch.zeros(1, 1, 1, 3, dtype=torch.uint8)}
 
         barcode_h = getattr(self.config, "barcode_height", 16)
         mode = str(getattr(self.config, "buffer_mode", "strip"))
@@ -871,8 +872,11 @@ class BpmTimecodeStripPipeline(Pipeline):
             self._loop_playhead = 0
             logger.info("[BPM Buffer Output] Loop reset")
 
-        # Stack frames
-        frames = torch.cat(video, dim=0).float()  # (F, H, W, C), [0, 255]
+        # Stack frames — handle both list of tensors and single tensor
+        if isinstance(video, list):
+            frames = torch.cat(video, dim=0).float()
+        else:
+            frames = video.float() if video.dim() == 4 else video.unsqueeze(0).float()
         F, H, W, C = frames.shape
         barcode_h = min(barcode_h, H // 4)
         now = time.monotonic()
@@ -937,11 +941,7 @@ class BpmTimecodeStripPipeline(Pipeline):
         out_np = np.stack(output_frames, axis=0)  # (F, H, W, C)
         out_tensor = torch.from_numpy(out_np).to(torch.uint8)
 
-        # Return as list of (1, H, W, C) uint8 tensors (same format Scope passes in)
-        F_out = out_tensor.shape[0]
-        video_out = [out_tensor[i:i+1] for i in range(F_out)]
-
-        result = {"video": video_out}
+        result = {"video": out_tensor}
 
         # Diagnostics
         total = self._decode_success + self._decode_fail
