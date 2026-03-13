@@ -817,6 +817,7 @@ class BpmTimecodeStripPipeline(Pipeline):
         # Beat-quantized buffer
         self._beat_buffer: list[_BufferedFrame] = []
         self._last_released_beat: int = -1
+        self._last_released_frame: Optional[np.ndarray] = None
 
         # Loop buffer
         self._loop_frames: list[_BufferedFrame] = []
@@ -1001,31 +1002,31 @@ class BpmTimecodeStripPipeline(Pipeline):
     ) -> list[np.ndarray]:
         """
         Beat-quantized mode: buffer incoming frames, release the best frame
-        for each new whole beat boundary. hold_beats controls how many beats
-        of history to keep in the buffer (MIDI-mappable).
+        for each new whole beat boundary. Between beats, HOLD the last released
+        frame frozen (creating a stepped/stutter effect synced to the beat).
+
+        hold_beats controls how many beats of history to keep (MIDI-mappable).
 
         When Ableton Link is active, uses Link's beat position for timing
         instead of decoded barcode beats — more reliable for local playback.
         """
         self._beat_buffer.extend(incoming)
 
-        # Find the latest beat in the buffer
         if not self._beat_buffer:
             return [incoming[-1].frame] if incoming else []
 
-        # Use Link beat if available for more accurate timing
+        # Use Link beat if available, otherwise use decoded barcode beats
         if self._link_active and self._clock is not None:
             latest_beat = self._clock.beat
         else:
             latest_beat = max(bf.beat for bf in self._beat_buffer)
         current_whole = int(latest_beat)
 
-        output = []
         if current_whole > self._last_released_beat:
             # New beat boundary — find the frame closest to this beat
             target = float(current_whole)
             best = min(self._beat_buffer, key=lambda bf: abs(bf.beat - target))
-            output.append(best.frame)
+            self._last_released_frame = best.frame
             self._last_released_beat = current_whole
 
             # Prune old frames (keep only frames within hold window)
@@ -1035,11 +1036,12 @@ class BpmTimecodeStripPipeline(Pipeline):
                 if bf.beat >= cutoff
             ]
 
-        if not output:
-            # No new beat yet — hold last frame
-            output.append(self._beat_buffer[-1].frame)
+        # Always return the last released frame (held frozen between beats)
+        if self._last_released_frame is not None:
+            return [self._last_released_frame]
 
-        return output
+        # First frame ever — no beat boundary crossed yet, show latest
+        return [self._beat_buffer[-1].frame]
 
     def _process_loop(
         self, incoming: list[_BufferedFrame], loop_length_beats: int
