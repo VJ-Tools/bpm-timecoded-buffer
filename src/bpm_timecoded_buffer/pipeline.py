@@ -718,10 +718,50 @@ if _HAS_SCOPE:
             ),
         )
 
-        loop_reset: bool = Field(
+        hold: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
                 order=7,
+                label="HOLD (freeze playback)",
+                is_load_param=False,
+            ),
+        )
+
+        min_buffer_beats: int = Field(
+            default=8,
+            ge=1,
+            le=32,
+            json_schema_extra=ui_field_config(
+                order=8,
+                label="Min Buffer (beats)",
+                is_load_param=False,
+            ),
+        )
+
+        auto_loop_beats: int = Field(
+            default=4,
+            ge=2,
+            le=8,
+            json_schema_extra=ui_field_config(
+                order=9,
+                label="Auto-Loop Length (beats)",
+                is_load_param=False,
+            ),
+        )
+
+        jump_ahead: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=10,
+                label="Jump Ahead (trim to min buffer)",
+                is_load_param=False,
+            ),
+        )
+
+        loop_reset: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=11,
                 label="Reset Loop",
                 is_load_param=False,
             ),
@@ -732,7 +772,7 @@ if _HAS_SCOPE:
             ge=1,
             le=100,
             json_schema_extra=ui_field_config(
-                order=8,
+                order=12,
                 label="Latency Nudge Step (ms)",
                 is_load_param=False,
             ),
@@ -750,6 +790,10 @@ else:
             self.beat_hold_beats = kwargs.get("beat_hold_beats", 2)
             self.link_sync = kwargs.get("link_sync", False)
             self.link_bpm = kwargs.get("link_bpm", 120.0)
+            self.hold = kwargs.get("hold", False)
+            self.min_buffer_beats = kwargs.get("min_buffer_beats", 8)
+            self.auto_loop_beats = kwargs.get("auto_loop_beats", 4)
+            self.jump_ahead = kwargs.get("jump_ahead", False)
             self.loop_reset = kwargs.get("loop_reset", False)
             self.latency_nudge_ms = kwargs.get("latency_nudge_ms", 10)
 
@@ -818,6 +862,19 @@ class BpmTimecodeStripPipeline(Pipeline):
         self._beat_buffer: list[_BufferedFrame] = []
         self._last_released_beat: int = -1
         self._last_released_frame: Optional[np.ndarray] = None
+        self._latest_decoded_beat: float = -1.0
+        self._prev_decoded_beat: float = -1.0
+
+        # Hold state (CDJ-style freeze)
+        self._hold_active: bool = False
+        self._hold_playhead_beat: int = -1
+        self._playback_cursor: int = -1  # -1 = normal, >= 0 = offset playback
+
+        # Auto-loop on catchup
+        self._auto_loop_active: bool = False
+        self._auto_loop_start: int = -1
+        self._auto_loop_end: int = -1
+        self._auto_loop_cursor: int = -1
 
         # Loop buffer
         self._loop_frames: list[_BufferedFrame] = []
@@ -879,6 +936,10 @@ class BpmTimecodeStripPipeline(Pipeline):
         beat_hold = kwargs.get("beat_hold_beats", getattr(self.config, "beat_hold_beats", 2))
         loop_reset = kwargs.get("loop_reset", getattr(self.config, "loop_reset", False))
         link_sync = kwargs.get("link_sync", getattr(self.config, "link_sync", False))
+        hold = kwargs.get("hold", getattr(self.config, "hold", False))
+        min_buffer = kwargs.get("min_buffer_beats", getattr(self.config, "min_buffer_beats", 8))
+        auto_loop_beats = kwargs.get("auto_loop_beats", getattr(self.config, "auto_loop_beats", 4))
+        jump_ahead = kwargs.get("jump_ahead", getattr(self.config, "jump_ahead", False))
 
         # --- Ableton Link toggle ---
         if link_sync and not self._link_active:
@@ -894,6 +955,46 @@ class BpmTimecodeStripPipeline(Pipeline):
             self._loop_start_beat = None
             self._loop_playhead = 0
             logger.info("[BPM Buffer Output] Loop reset")
+
+        # --- Hold toggle (CDJ-style) ---
+        if hold and not self._hold_active:
+            # Engage hold — freeze at current playback position
+            self._hold_active = True
+            if self._playback_cursor >= 0:
+                self._hold_playhead_beat = self._playback_cursor
+            elif self._latest_decoded_beat >= 0:
+                self._hold_playhead_beat = int(self._latest_decoded_beat) - beat_hold
+            else:
+                self._hold_playhead_beat = self._last_released_beat
+            logger.info(f"[BPM Buffer Output] HOLD engaged at beat {self._hold_playhead_beat}")
+        elif not hold and self._hold_active:
+            # Release hold — resume from held position
+            self._hold_active = False
+            self._playback_cursor = self._hold_playhead_beat
+            self._hold_playhead_beat = -1
+            self._auto_loop_active = False
+            logger.info(f"[BPM Buffer Output] HOLD released, cursor at {self._playback_cursor}")
+
+        # --- Jump Ahead trigger ---
+        if jump_ahead and self._latest_decoded_beat >= 0:
+            effective_min = max(min_buffer, beat_hold)
+            latest_whole = int(self._latest_decoded_beat)
+            normal_target = latest_whole - beat_hold
+            current_playback = self._playback_cursor if self._playback_cursor >= 0 else normal_target
+            gap = normal_target - current_playback
+            if gap > 0:
+                new_target = latest_whole - effective_min
+                self._playback_cursor = new_target
+                self._auto_loop_active = False
+                # Prune frames we jumped past
+                self._beat_buffer = [
+                    bf for bf in self._beat_buffer
+                    if bf.beat >= new_target - 2
+                ]
+                logger.info(
+                    f"[BPM Buffer Output] JUMP AHEAD: skipped {gap - effective_min} beats, "
+                    f"cursor now at {new_target}"
+                )
 
         # Stack frames — handle both list of tensors and single tensor
         if isinstance(video, list):
@@ -953,7 +1054,9 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # --- Apply buffer mode ---
         if mode == "beat":
-            output_frames = self._process_beat_quantized(incoming, beat_hold)
+            output_frames = self._process_beat_quantized(
+                incoming, beat_hold, auto_loop_beats
+            )
         elif mode == "loop":
             output_frames = self._process_loop(incoming, loop_len)
         elif mode == "latency":
@@ -965,10 +1068,17 @@ class BpmTimecodeStripPipeline(Pipeline):
         # Log every 100 frames for diagnostics
         total = self._decode_success + self._decode_fail
         if total % 100 == 1:
+            # Calculate buffer fill
+            if self._latest_decoded_beat >= 0:
+                current_pb = self._playback_cursor if self._playback_cursor >= 0 else int(self._latest_decoded_beat) - beat_hold
+                fill = int(self._latest_decoded_beat) - current_pb
+            else:
+                fill = 0
             logger.info(
                 f"[BPM Buffer Output] mode={mode}, decode={self._decode_success}/{total}, "
-                f"link={self._link_active}, incoming={len(incoming)}, "
-                f"output={len(output_frames)}"
+                f"link={self._link_active}, hold={self._hold_active}, "
+                f"fill={fill}b, autoloop={self._auto_loop_active}, "
+                f"incoming={len(incoming)}, output={len(output_frames)}"
             )
 
         # Convert back to tensor
@@ -983,12 +1093,21 @@ class BpmTimecodeStripPipeline(Pipeline):
         # Diagnostics
         total = self._decode_success + self._decode_fail
         rate = self._decode_success / total if total > 0 else 0.0
+        if self._latest_decoded_beat >= 0:
+            current_pb = self._playback_cursor if self._playback_cursor >= 0 else int(self._latest_decoded_beat) - beat_hold
+            fill = int(self._latest_decoded_beat) - current_pb
+        else:
+            fill = 0
         result["_bpm_buffer_output_meta"] = {
             "decode_rate": rate,
             "decode_success": self._decode_success,
             "decode_fail": self._decode_fail,
             "buffer_mode": mode,
             "buffer_size": len(self._beat_buffer) + len(self._loop_frames) + len(self._latency_fifo),
+            "buffer_fill_beats": fill,
+            "hold_active": self._hold_active,
+            "auto_loop_active": self._auto_loop_active,
+            "playback_cursor": self._playback_cursor,
             "link_active": self._link_active,
             "link_beat": self._clock.beat if self._clock else None,
             "link_bpm": self._clock.tempo if self._clock else None,
@@ -998,49 +1117,141 @@ class BpmTimecodeStripPipeline(Pipeline):
         return result
 
     def _process_beat_quantized(
-        self, incoming: list[_BufferedFrame], hold_beats: int = 2
+        self,
+        incoming: list[_BufferedFrame],
+        hold_beats: int = 2,
+        auto_loop_beats: int = 4,
     ) -> list[np.ndarray]:
         """
-        Beat-quantized mode: buffer incoming frames, release the best frame
-        for each new whole beat boundary. Between beats, HOLD the last released
-        frame frozen (creating a stepped/stutter effect synced to the beat).
+        Beat-quantized mode with CDJ-style hold, auto-loop, and playback cursor.
 
-        hold_beats controls how many beats of history to keep (MIDI-mappable).
+        Three states:
+        1. HOLD active → freeze at held beat, keep ingesting
+        2. AUTO-LOOP → cycle last N beats when buffer exhausted
+        3. Normal → advance playback cursor or use (latest - depth)
 
-        When Ableton Link is active, uses Link's beat position for timing
-        instead of decoded barcode beats — more reliable for local playback.
+        Between beat boundaries, the last released frame is held frozen
+        (stepped/stutter effect synced to the beat grid).
         """
         self._beat_buffer.extend(incoming)
 
         if not self._beat_buffer:
             return [incoming[-1].frame] if incoming else []
 
-        # Use Link beat if available, otherwise use decoded barcode beats
+        # Track latest decoded beat
         if self._link_active and self._clock is not None:
             latest_beat = self._clock.beat
         else:
             latest_beat = max(bf.beat for bf in self._beat_buffer)
-        current_whole = int(latest_beat)
 
-        if current_whole > self._last_released_beat:
-            # New beat boundary — find the frame closest to this beat
-            target = float(current_whole)
-            best = min(self._beat_buffer, key=lambda bf: abs(bf.beat - target))
+        latest_whole = int(latest_beat)
+
+        # Advance playback cursor when new beats arrive
+        if latest_whole > int(self._latest_decoded_beat) and self._latest_decoded_beat >= 0:
+            advance = latest_whole - int(self._latest_decoded_beat)
+            if self._playback_cursor >= 0 and advance > 0 and advance < 16:
+                self._playback_cursor += advance
+                # Check if cursor caught up to normal target
+                normal_target = latest_whole - hold_beats
+                if self._playback_cursor >= normal_target:
+                    self._playback_cursor = -1  # resume normal
+
+        self._prev_decoded_beat = self._latest_decoded_beat
+        self._latest_decoded_beat = latest_beat
+
+        # --- HOLD: freeze playback ---
+        if self._hold_active:
+            if self._hold_playhead_beat >= 0:
+                # Find frame at held beat
+                best = None
+                best_dist = float('inf')
+                for bf in self._beat_buffer:
+                    d = abs(bf.beat - self._hold_playhead_beat)
+                    if d < best_dist:
+                        best_dist = d
+                        best = bf
+                if best is not None:
+                    self._last_released_frame = best.frame
+
+            # Don't evict during hold — keep all frames
+            # But cap at 256 to prevent memory blowout
+            if len(self._beat_buffer) > 256:
+                self._beat_buffer = self._beat_buffer[-256:]
+
+            if self._last_released_frame is not None:
+                return [self._last_released_frame]
+            return [self._beat_buffer[-1].frame]
+
+        # --- Compute target beat ---
+        if self._playback_cursor >= 0:
+            target_whole = self._playback_cursor
+        else:
+            target_whole = latest_whole - hold_beats
+
+        # --- AUTO-LOOP: check catchup ---
+        if self._auto_loop_active:
+            # Check if enough new frames arrived to exit
+            available = latest_whole - target_whole
+            if available >= auto_loop_beats:
+                self._auto_loop_active = False
+                self._auto_loop_cursor = -1
+            else:
+                # Advance loop cursor
+                self._auto_loop_cursor += 1
+                loop_len = self._auto_loop_end - self._auto_loop_start
+                if loop_len > 0 and (self._auto_loop_cursor - self._auto_loop_start) >= loop_len:
+                    self._auto_loop_cursor = self._auto_loop_start
+
+                # Find frame at loop cursor position
+                best = None
+                best_dist = float('inf')
+                for bf in self._beat_buffer:
+                    d = abs(bf.beat - self._auto_loop_cursor)
+                    if d < best_dist:
+                        best_dist = d
+                        best = bf
+                if best is not None:
+                    self._last_released_frame = best.frame
+
+                if self._last_released_frame is not None:
+                    return [self._last_released_frame]
+                return [self._beat_buffer[-1].frame]
+
+        # --- Normal playback ---
+        if target_whole > self._last_released_beat:
+            # New beat boundary
+            target_f = float(target_whole)
+            best = min(self._beat_buffer, key=lambda bf: abs(bf.beat - target_f))
             self._last_released_frame = best.frame
-            self._last_released_beat = current_whole
+            self._last_released_beat = target_whole
+        elif target_whole < self._last_released_beat and not self._beat_buffer:
+            # No frames at target — check if we should auto-loop
+            pass
 
-            # Prune old frames (keep only frames within hold window)
-            cutoff = current_whole - hold_beats
-            self._beat_buffer = [
-                bf for bf in self._beat_buffer
-                if bf.beat >= cutoff
-            ]
+        # Check if buffer exhausted (playback caught up to live)
+        available = latest_whole - target_whole
+        if available <= 0 and len(self._beat_buffer) >= 2 and not self._auto_loop_active:
+            self._auto_loop_active = True
+            self._auto_loop_end = target_whole
+            self._auto_loop_start = target_whole - auto_loop_beats
+            self._auto_loop_cursor = self._auto_loop_start
+            logger.info(
+                f"[BPM Buffer Output] Auto-loop engaged: "
+                f"beats {self._auto_loop_start}-{self._auto_loop_end}"
+            )
 
-        # Always return the last released frame (held frozen between beats)
+        # Evict old frames — keep frames from earliest needed position
+        earliest = min(target_whole, self._auto_loop_start if self._auto_loop_active else target_whole)
+        self._beat_buffer = [
+            bf for bf in self._beat_buffer
+            if bf.beat >= earliest - 2
+        ]
+        # Hard cap
+        if len(self._beat_buffer) > 256:
+            self._beat_buffer = self._beat_buffer[-256:]
+
         if self._last_released_frame is not None:
             return [self._last_released_frame]
-
-        # First frame ever — no beat boundary crossed yet, show latest
         return [self._beat_buffer[-1].frame]
 
     def _process_loop(
