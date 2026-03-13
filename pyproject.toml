@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bpm-timecoded-buffer"
-version = "0.4.3"
+version = "0.4.4"
 description = "BPM Timecoded Buffer — Daydream Scope plugin, part of OpticMystic's VJ.Tools collection. Stamps beat-grid timecodes using Ableton Link, preserves them through AI generation via VACE masking. ControlNet preprocessing (canny, depth, scribble). BCH error-corrected barcode survives diffusion for beat-accurate output timing."
 requires-python = ">=3.10"
 dependencies = [

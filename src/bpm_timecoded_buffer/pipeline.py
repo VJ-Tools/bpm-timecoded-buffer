@@ -257,8 +257,8 @@ if _HAS_SCOPE:
             ),
         )
 
-        control_mode: str = Field(
-            default="none",
+        control_mode: ControlMode = Field(
+            default=ControlMode.NONE,
             json_schema_extra=ui_field_config(
                 order=2,
                 label="Control Mode",
@@ -316,6 +316,15 @@ if _HAS_SCOPE:
                 is_load_param=False,
             ),
         )
+
+        tap_tempo: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=8,
+                label="Tap Tempo",
+                is_load_param=False,
+            ),
+        )
 else:
     class BpmBufferConfig:
         """Standalone config (no Pydantic) for testing outside Scope."""
@@ -330,6 +339,7 @@ else:
             self.mask_feather = kwargs.get("mask_feather", 2)
             self.strip_barcode = kwargs.get("strip_barcode", False)
             self.test_input = kwargs.get("test_input", False)
+            self.tap_tempo = kwargs.get("tap_tempo", False)
 
 
 # --- Pipeline ---
@@ -358,6 +368,7 @@ class BpmTimecodedBufferPipeline(Pipeline):
         config,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float16,
+        **kwargs,  # Scope passes height, width, quantization, loras, etc.
     ):
         self.config = config
         self.device = (
@@ -416,12 +427,17 @@ class BpmTimecodedBufferPipeline(Pipeline):
         """
         video = kwargs.get("video", [])
         barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
-        control_mode = kwargs.get("control_mode", getattr(self.config, "control_mode", "none"))
+        control_mode = str(kwargs.get("control_mode", getattr(self.config, "control_mode", "none")))
         canny_low = kwargs.get("canny_low", getattr(self.config, "canny_low", 50))
         canny_high = kwargs.get("canny_high", getattr(self.config, "canny_high", 150))
         mask_feather = kwargs.get("mask_feather", getattr(self.config, "mask_feather", 2))
         strip_barcode = kwargs.get("strip_barcode", getattr(self.config, "strip_barcode", False))
         test_input = kwargs.get("test_input", getattr(self.config, "test_input", False))
+        tap_tempo = kwargs.get("tap_tempo", getattr(self.config, "tap_tempo", False))
+
+        # --- Tap tempo (boolean toggle triggers a tap) ---
+        if tap_tempo:
+            self.tap_bpm()
 
         if not video:
             return {"video": torch.zeros(1, 1, 1, 3)}
@@ -635,6 +651,7 @@ class BpmTimecodeStripPipeline(Pipeline):
         config,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float16,
+        **kwargs,  # Scope passes height, width, quantization, loras, etc.
     ):
         self.config = config
         self.device = (
