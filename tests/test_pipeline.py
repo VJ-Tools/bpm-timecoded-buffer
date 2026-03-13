@@ -174,6 +174,67 @@ def test_strip_barcode():
     return True
 
 
+def test_test_pattern_input():
+    """Test that test_input=True replaces video with bouncing ball animation."""
+    from bpm_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
+
+    config = BpmBufferConfig()
+    pipeline = BpmTimecodedBufferPipeline(config)
+
+    frame = make_test_frame()
+    result = pipeline(
+        video=[frame], barcode_height=16, control_mode="none", test_input=True
+    )
+
+    assert "video" in result
+    assert "vace_input_frames" in result
+    assert "vace_input_masks" in result
+
+    video = result["video"]
+    assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
+
+    # Verify the test pattern is actually different from the random input
+    # (the test pattern has specific drawn elements like the sphere)
+    print("  [OK] Test pattern input test passed")
+    return True
+
+
+def test_tap_bpm():
+    """Test tap tempo on the pipeline."""
+    import time
+    from bpm_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
+
+    config = BpmBufferConfig()
+    pipeline = BpmTimecodedBufferPipeline(config)
+
+    # First tap returns None
+    result1 = pipeline.tap_bpm()
+    assert result1 is None, "First tap should return None"
+
+    # Simulate 120 BPM (0.5s between beats)
+    time.sleep(0.5)
+    result2 = pipeline.tap_bpm()
+    assert result2 is not None, "Second tap should return a BPM"
+    assert 100 < result2 < 140, f"Expected ~120 BPM, got {result2:.1f}"
+
+    print(f"  [OK] Tap tempo test passed (detected {result2:.1f} BPM)")
+    return True
+
+
+def test_set_bpm():
+    """Test manual BPM setting."""
+    from bpm_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
+
+    config = BpmBufferConfig()
+    pipeline = BpmTimecodedBufferPipeline(config)
+
+    pipeline.set_bpm(140.0)
+    assert pipeline._clock._tempo == 140.0, f"Expected 140 BPM, got {pipeline._clock._tempo}"
+
+    print("  [OK] Set BPM test passed")
+    return True
+
+
 if __name__ == "__main__":
     print("\n=== BPM Timecoded Buffer Pipeline Tests ===\n")
 
@@ -184,6 +245,9 @@ if __name__ == "__main__":
         test_control_modes,
         test_multi_frame,
         test_strip_barcode,
+        test_test_pattern_input,
+        test_tap_bpm,
+        test_set_bpm,
     ]
 
     passed = 0

@@ -67,4 +67,4 @@ python tests/test_pipeline.py
 
 ## License
 
-MIT
+MIT — Part of [OpticMystic's VJ.Tools](https://github.com/OpticMystic) collection

@@ -41,6 +41,7 @@ from .vjsync_codec import (
     encode_beat_frac,
     stamp_barcode,
 )
+from .test_source import TestPatternSource
 
 try:
     from scope.core.pipeline import Pipeline
@@ -292,6 +293,17 @@ if _HAS_SCOPE:
             ),
         )
 
+        test_input: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=7,
+                label="Test Pattern Input",
+                description="Replace live input with built-in bouncing ball test animation. "
+                            "Use to verify barcode stamping and VACE masking without a camera.",
+                is_load_param=False,
+            ),
+        )
+
         usage: list = [UsageType.PREPROCESSOR]
 else:
     class BpmBufferConfig:
@@ -306,6 +318,7 @@ else:
             self.canny_high = kwargs.get("canny_high", 150)
             self.mask_feather = kwargs.get("mask_feather", 2)
             self.strip_barcode = kwargs.get("strip_barcode", False)
+            self.test_input = kwargs.get("test_input", False)
 
 
 # --- Pipeline ---
@@ -334,6 +347,9 @@ class BpmTimecodedBufferPipeline(Pipeline):
         self._clock = LinkClock(config.initial_bpm)
         self._clock.start(config.initial_bpm)
 
+        # Test pattern source (lazy-initialized on first use)
+        self._test_source: Optional[TestPatternSource] = None
+
         logger.info(
             f"[BPM Buffer] Pipeline initialized "
             f"(device={self.device}, bpm={config.initial_bpm})"
@@ -342,6 +358,29 @@ class BpmTimecodedBufferPipeline(Pipeline):
     def __del__(self):
         if hasattr(self, "_clock"):
             self._clock.stop()
+
+    def tap_bpm(self) -> Optional[float]:
+        """
+        Tap tempo — call repeatedly to tap in a BPM.
+        Useful on RunPod or anywhere without Ableton Link.
+        Returns detected BPM after 2+ taps, or None after first tap.
+        """
+        if self._test_source is None:
+            self._test_source = TestPatternSource()
+        detected = self._test_source.tap()
+        if detected is not None:
+            # Also update the Link clock's free-running fallback
+            self._clock._tempo = detected
+            logger.info(f"[BPM Buffer] Tap tempo: {detected:.1f} BPM")
+        return detected
+
+    def set_bpm(self, bpm: float):
+        """Manually set BPM (for RunPod / no-Link scenarios)."""
+        bpm = max(20.0, min(999.0, bpm))
+        self._clock._tempo = bpm
+        if self._test_source:
+            self._test_source.set_bpm(bpm)
+        logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
 
     @staticmethod
     def get_config_class():
@@ -367,9 +406,21 @@ class BpmTimecodedBufferPipeline(Pipeline):
         canny_high = kwargs.get("canny_high", self.config.canny_high)
         mask_feather = kwargs.get("mask_feather", self.config.mask_feather)
         strip_barcode = kwargs.get("strip_barcode", self.config.strip_barcode)
+        test_input = kwargs.get("test_input", self.config.test_input)
 
         if not video:
             return {"video": torch.zeros(1, 1, 1, 3)}
+
+        # --- Test pattern override ---
+        if test_input:
+            # Get dimensions from the first real frame (or use defaults)
+            ref = video[0]
+            _, H, W, _ = ref.shape
+            if self._test_source is None or self._test_source.width != W or self._test_source.height != H:
+                self._test_source = TestPatternSource(width=W, height=H)
+            video = self._test_source.generate_batch(
+                self._clock, num_frames=len(video), barcode_height=barcode_h
+            )
 
         # Stack frames
         frames = torch.cat(video, dim=0).float()  # (F, H, W, C), [0, 255]
