@@ -32,7 +32,6 @@ from typing import Optional
 import cv2
 import numpy as np
 import torch
-from pydantic import Field
 
 from .vjsync_codec import (
     VJSyncPayload,
@@ -43,21 +42,30 @@ from .vjsync_codec import (
 )
 from .test_source import TestPatternSource
 
+# --- Scope imports: match actual Scope package structure ---
 try:
-    from scope.core.pipeline import Pipeline
-    from scope.core.types import BasePipelineConfig, UsageType
-    from scope.core.ui import ui_field_config
+    from scope.core.pipelines.interface import Pipeline
+    from scope.core.pipelines.base_schema import BasePipelineConfig, UsageType, ui_field_config
     _HAS_SCOPE = True
 except ImportError:
+    # Fallback for running outside Scope (standalone tests)
     class Pipeline:
         pass
     class BasePipelineConfig:
         pass
     class UsageType:
         PREPROCESSOR = "preprocessor"
+        POSTPROCESSOR = "postprocessor"
     def ui_field_config(**kwargs):
         return kwargs
     _HAS_SCOPE = False
+
+# Also try importing Field from pydantic (only needed when Scope is present)
+try:
+    from pydantic import Field
+except ImportError:
+    def Field(**kwargs):
+        return kwargs.get("default")
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +227,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=0,
                 label="Initial BPM",
-                description="Starting BPM for the Ableton Link session",
                 is_load_param=True,
             ),
         )
@@ -233,7 +240,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=1,
                 label="Barcode Height (px)",
-                description="Height of the timecode barcode strip at the bottom of the frame",
                 is_load_param=False,
             ),
         )
@@ -243,7 +249,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=2,
                 label="Control Mode",
-                description="ControlNet preprocessing: none, canny, depth, or scribble",
                 is_load_param=False,
             ),
         )
@@ -277,7 +282,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=5,
                 label="Mask Feather (px)",
-                description="Soft transition at barcode boundary (0 = hard edge)",
                 is_load_param=False,
             ),
         )
@@ -287,8 +291,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=6,
                 label="Strip Barcode on Output",
-                description="Replace barcode strip with black on the display output. "
-                            "Leave OFF to verify barcode survives AI generation.",
                 is_load_param=False,
             ),
         )
@@ -298,8 +300,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=7,
                 label="Test Pattern Input",
-                description="Replace live input with built-in bouncing ball test animation. "
-                            "Use to verify barcode stamping and VACE masking without a camera.",
                 is_load_param=False,
             ),
         )
@@ -338,21 +338,34 @@ class BpmTimecodedBufferPipeline(Pipeline):
       - vace_input_masks [1,1,F,H,W] binary: 1=generate, 0=preserve
     """
 
-    def __init__(self, config: BpmBufferConfig, **kwargs):
+    @classmethod
+    def get_config_class(cls):
+        return BpmBufferConfig
+
+    def __init__(
+        self,
+        config,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float16,
+    ):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self.device = (
+            device if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.dtype = dtype if self.device.type == "cuda" else torch.float32
         self._frame_seq = 0
 
-        self._clock = LinkClock(config.initial_bpm)
-        self._clock.start(config.initial_bpm)
+        initial_bpm = getattr(config, "initial_bpm", 120.0)
+        self._clock = LinkClock(initial_bpm)
+        self._clock.start(initial_bpm)
 
         # Test pattern source (lazy-initialized on first use)
         self._test_source: Optional[TestPatternSource] = None
 
         logger.info(
             f"[BPM Buffer] Pipeline initialized "
-            f"(device={self.device}, bpm={config.initial_bpm})"
+            f"(device={self.device}, bpm={initial_bpm})"
         )
 
     def __del__(self):
@@ -369,7 +382,6 @@ class BpmTimecodedBufferPipeline(Pipeline):
             self._test_source = TestPatternSource()
         detected = self._test_source.tap()
         if detected is not None:
-            # Also update the Link clock's free-running fallback
             self._clock._tempo = detected
             logger.info(f"[BPM Buffer] Tap tempo: {detected:.1f} BPM")
         return detected
@@ -382,38 +394,29 @@ class BpmTimecodedBufferPipeline(Pipeline):
             self._test_source.set_bpm(bpm)
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
 
-    @staticmethod
-    def get_config_class():
-        return BpmBufferConfig
-
-    def __call__(self, video: list, **kwargs) -> dict:
+    def __call__(self, **kwargs) -> dict:
         """
-        Process input frames:
-        1. Stamp timecode barcode with current Link beat position
-        2. Create VACE mask to preserve barcode through AI
-        3. Optionally apply ControlNet preprocessing
+        Process input frames (Scope Pipeline interface).
 
-        Args:
-            video: List of frame tensors, each (1, H, W, C), range [0, 255]
-            **kwargs: Runtime parameters
+        Scope passes video as kwargs["video"] — a list of (1, H, W, C) uint8 tensors.
 
         Returns:
             dict with video, vace_input_frames, vace_input_masks
         """
-        barcode_h = kwargs.get("barcode_height", self.config.barcode_height)
-        control_mode = kwargs.get("control_mode", self.config.control_mode)
-        canny_low = kwargs.get("canny_low", self.config.canny_low)
-        canny_high = kwargs.get("canny_high", self.config.canny_high)
-        mask_feather = kwargs.get("mask_feather", self.config.mask_feather)
-        strip_barcode = kwargs.get("strip_barcode", self.config.strip_barcode)
-        test_input = kwargs.get("test_input", self.config.test_input)
+        video = kwargs.get("video", [])
+        barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
+        control_mode = kwargs.get("control_mode", getattr(self.config, "control_mode", "none"))
+        canny_low = kwargs.get("canny_low", getattr(self.config, "canny_low", 50))
+        canny_high = kwargs.get("canny_high", getattr(self.config, "canny_high", 150))
+        mask_feather = kwargs.get("mask_feather", getattr(self.config, "mask_feather", 2))
+        strip_barcode = kwargs.get("strip_barcode", getattr(self.config, "strip_barcode", False))
+        test_input = kwargs.get("test_input", getattr(self.config, "test_input", False))
 
         if not video:
             return {"video": torch.zeros(1, 1, 1, 3)}
 
         # --- Test pattern override ---
         if test_input:
-            # Get dimensions from the first real frame (or use defaults)
             ref = video[0]
             _, H, W, _ = ref.shape
             if self._test_source is None or self._test_source.width != W or self._test_source.height != H:
@@ -454,9 +457,6 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
         # --- 2. Generate VACE mask ---
         # mask=1 -> inpaint (AI generates), mask=0 -> preserve (barcode survives)
-        # Scope's VaceEncodingBlock handles the split internally:
-        #   inactive stream = frame * (1 - mask)  -> preserves barcode
-        #   reactive stream = frame * mask         -> AI generates content
         mask = torch.ones(F, H, W, dtype=torch.float32)
         mask[:, -barcode_h:, :] = 0.0  # Preserve barcode strip
 
@@ -469,7 +469,6 @@ class BpmTimecodedBufferPipeline(Pipeline):
                     mask[:, boundary_y - dy - 1, :] = alpha
 
         # --- 3. Build VACE tensors ---
-        # Pass FULL stamped frames -- Scope handles masking internally
         frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
         vace_frames = (frames_01 * 2.0 - 1.0).permute(3, 0, 1, 2).unsqueeze(0)
         # -> (1, C=3, F, H, W), [-1, 1]
@@ -488,7 +487,6 @@ class BpmTimecodedBufferPipeline(Pipeline):
         # --- 5. Display output ---
         display = frames_01.clone()
         if strip_barcode:
-            # Clean output: replace barcode strip with black
             display[:, -barcode_h:, :, :] = 0.0
         else:
             # Show barcode with subtle green tint so you can verify it survives
@@ -561,3 +559,100 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
         control = torch.from_numpy(control_np).float() / 255.0
         return control.to(device=self.device)
+
+
+# --- Postprocessor Config ---
+
+if _HAS_SCOPE:
+    class BpmStripConfig(BasePipelineConfig):
+        """Configuration schema for BPM Timecode Strip (postprocessor)."""
+
+        pipeline_id: str = "bpm_timecode_strip"
+        pipeline_name: str = "BPM Timecode Strip (VJ.Tools)"
+        pipeline_description: str = (
+            "Postprocessor that strips the timecode barcode from AI output. "
+            "Blacks out the barcode strip so viewers don't see it. "
+            "The barcode has already been read by the client at this point."
+        )
+        supports_prompts: bool = False
+
+        barcode_height: int = Field(
+            default=16,
+            ge=4,
+            le=128,
+            json_schema_extra=ui_field_config(
+                order=0,
+                label="Barcode Height (px)",
+                is_load_param=False,
+            ),
+        )
+
+        usage: list = [UsageType.POSTPROCESSOR]
+else:
+    class BpmStripConfig:
+        """Standalone config for testing outside Scope."""
+        def __init__(self, **kwargs):
+            self.pipeline_id = kwargs.get("pipeline_id", "bpm_timecode_strip")
+            self.pipeline_name = kwargs.get("pipeline_name", "BPM Timecode Strip (VJ.Tools)")
+            self.barcode_height = kwargs.get("barcode_height", 16)
+
+
+# --- Postprocessor Pipeline ---
+
+class BpmTimecodeStripPipeline(Pipeline):
+    """
+    Scope postprocessor that strips the timecode barcode from AI output.
+
+    After AI generation, the barcode strip has already been preserved via VACE
+    masking. The client has already read/decoded the barcode from the WebRTC
+    output. This postprocessor blacks out the barcode region so viewers don't
+    see it in the final output.
+    """
+
+    @classmethod
+    def get_config_class(cls):
+        return BpmStripConfig
+
+    def __init__(
+        self,
+        config,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float16,
+    ):
+        self.config = config
+        self.device = (
+            device if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.dtype = dtype if self.device.type == "cuda" else torch.float32
+
+        logger.info("[BPM Strip] Postprocessor initialized")
+
+    def __call__(self, **kwargs) -> dict:
+        """
+        Strip barcode from AI output frames.
+
+        Scope passes video as kwargs["video"] — a list of (1, H, W, C) uint8 tensors.
+
+        Returns:
+            dict with video (barcode region blacked out)
+        """
+        video = kwargs.get("video", [])
+
+        if not video:
+            return {"video": torch.zeros(1, 1, 1, 3)}
+
+        barcode_h = getattr(self.config, "barcode_height", 16)
+
+        # Stack frames
+        frames = torch.cat(video, dim=0).float()  # (F, H, W, C), [0, 255]
+        F, H, W, C = frames.shape
+        barcode_h = min(barcode_h, H // 4)
+
+        # Black out the barcode strip
+        frames[:, -barcode_h:, :, :] = 0.0
+
+        # Normalize to [0, 1] for display
+        display = frames / 255.0
+
+        return {"video": display.cpu()}

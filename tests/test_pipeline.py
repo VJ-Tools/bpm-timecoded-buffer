@@ -235,6 +235,33 @@ def test_set_bpm():
     return True
 
 
+def test_postprocessor_strip():
+    """Test that the postprocessor strips the barcode from output."""
+    from bpm_timecoded_buffer.pipeline import BpmTimecodeStripPipeline, BpmStripConfig
+
+    config = BpmStripConfig()
+    pipeline = BpmTimecodeStripPipeline(config)
+
+    barcode_h = 16
+    frame = make_test_frame(barcode_height=barcode_h)
+    result = pipeline(video=[frame])
+
+    assert "video" in result
+    video = result["video"]
+    assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
+
+    # Bottom strip should be all black (0.0)
+    bottom = video[0, -barcode_h:, :, :]
+    assert bottom.max() == 0.0, f"Barcode region should be blacked out, got max={bottom.max()}"
+
+    # Content above should NOT be all black
+    content = video[0, :-barcode_h, :, :]
+    assert content.max() > 0.0, "Content region should have data"
+
+    print("  [OK] Postprocessor strip test passed")
+    return True
+
+
 if __name__ == "__main__":
     print("\n=== BPM Timecoded Buffer Pipeline Tests ===\n")
 
@@ -248,6 +275,7 @@ if __name__ == "__main__":
         test_test_pattern_input,
         test_tap_bpm,
         test_set_bpm,
+        test_postprocessor_strip,
     ]
 
     passed = 0

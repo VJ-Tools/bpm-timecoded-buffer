@@ -14,13 +14,14 @@ except ImportError:
     def hookimpl(f):
         return f
 
-from .pipeline import BpmTimecodedBufferPipeline
+from .pipeline import BpmTimecodedBufferPipeline, BpmTimecodeStripPipeline
 
 logger = logging.getLogger(__name__)
 
 
 @hookimpl
 def register_pipelines(register):
-    """Register the BPM Timecoded Buffer pipeline with Scope."""
+    """Register BPM Timecoded Buffer pipelines with Scope."""
     register(BpmTimecodedBufferPipeline)
-    logger.info("[BPM Buffer] Registered BPM Timecoded Buffer preprocessor")
+    register(BpmTimecodeStripPipeline)
+    logger.info("[BPM Buffer] Registered preprocessor + postprocessor")
