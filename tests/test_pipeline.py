@@ -25,6 +25,13 @@ def make_test_frame(width=576, height=336, barcode_height=16):
     return frame
 
 
+def _stack_video(video_out):
+    """Helper: stack list of (1,H,W,C) tensors into (F,H,W,C)."""
+    if isinstance(video_out, list):
+        return torch.cat(video_out, dim=0)
+    return video_out
+
+
 def test_basic_mask():
     """Test that the pipeline generates correct VACE mask dimensions."""
     from bpm_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
@@ -39,7 +46,7 @@ def test_basic_mask():
     assert "vace_input_frames" in result
     assert "vace_input_masks" in result
 
-    video = result["video"]
+    video = _stack_video(result["video"])
     vace_frames = result["vace_input_frames"]
     vace_masks = result["vace_input_masks"]
 
@@ -47,11 +54,11 @@ def test_basic_mask():
     assert vace_frames.shape == (1, 3, 1, 336, 576), f"VACE frames shape wrong: {vace_frames.shape}"
     assert vace_masks.shape == (1, 1, 1, 336, 576), f"VACE mask shape wrong: {vace_masks.shape}"
 
-    assert video.min() >= 0.0 and video.max() <= 1.0
+    # Video is now uint8 [0, 255]
+    assert video.max() <= 255
     assert vace_frames.min() >= -1.0 and vace_frames.max() <= 1.0
 
     print("  [OK] Basic mask test passed")
-    return True
 
 
 def test_barcode_preserved():
@@ -73,7 +80,6 @@ def test_barcode_preserved():
     assert content_mask[0, 0] == 1.0, f"Content region should start at 1.0, got {content_mask[0, 0]}"
 
     print("  [OK] Barcode preservation test passed")
-    return True
 
 
 def test_barcode_in_vace_frames():
@@ -94,7 +100,6 @@ def test_barcode_in_vace_frames():
     assert len(unique_vals) >= 2, f"VACE frames should have barcode data, got: {unique_vals}"
 
     print("  [OK] Barcode in VACE frames test passed")
-    return True
 
 
 def test_control_modes():
@@ -118,8 +123,6 @@ def test_control_modes():
 
         print(f"  [OK] Control mode '{mode}' passed")
 
-    return True
-
 
 def test_multi_frame():
     """Test with multiple frames (batch processing)."""
@@ -131,12 +134,12 @@ def test_multi_frame():
     frames = [make_test_frame() for _ in range(4)]
     result = pipeline(video=frames, barcode_height=16, control_mode="none")
 
-    assert result["video"].shape[0] == 4
+    video = _stack_video(result["video"])
+    assert video.shape[0] == 4
     assert result["vace_input_frames"].shape[2] == 4
     assert result["vace_input_masks"].shape[2] == 4
 
     print("  [OK] Multi-frame test passed")
-    return True
 
 
 def test_strip_barcode():
@@ -154,7 +157,8 @@ def test_strip_barcode():
         video=[frame], barcode_height=barcode_h, control_mode="none",
         strip_barcode=False,
     )
-    bottom_visible = (result_visible["video"][0, -barcode_h:, :, :] * 255).numpy().astype(np.uint8)
+    vid_visible = _stack_video(result_visible["video"])
+    bottom_visible = vid_visible[0, -barcode_h:, :, :].numpy()
     assert len(np.unique(bottom_visible)) >= 2, "Barcode should be visible by default"
 
     # strip_barcode=True: barcode blacked out in display
@@ -162,7 +166,8 @@ def test_strip_barcode():
         video=[frame], barcode_height=barcode_h, control_mode="none",
         strip_barcode=True,
     )
-    bottom_stripped = (result_stripped["video"][0, -barcode_h:, :, :] * 255).numpy().astype(np.uint8)
+    vid_stripped = _stack_video(result_stripped["video"])
+    bottom_stripped = vid_stripped[0, -barcode_h:, :, :].numpy()
     assert np.all(bottom_stripped == 0), "Bottom strip should be black when strip_barcode=True"
 
     # VACE frames must still have barcode regardless of strip_barcode
@@ -171,7 +176,6 @@ def test_strip_barcode():
     assert len(np.unique(vace_uint8)) >= 2, "VACE frames must have barcode even when display stripped"
 
     print("  [OK] Strip barcode test passed")
-    return True
 
 
 def test_test_pattern_input():
@@ -190,13 +194,10 @@ def test_test_pattern_input():
     assert "vace_input_frames" in result
     assert "vace_input_masks" in result
 
-    video = result["video"]
+    video = _stack_video(result["video"])
     assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
 
-    # Verify the test pattern is actually different from the random input
-    # (the test pattern has specific drawn elements like the sphere)
     print("  [OK] Test pattern input test passed")
-    return True
 
 
 def test_tap_bpm():
@@ -218,7 +219,6 @@ def test_tap_bpm():
     assert 100 < result2 < 140, f"Expected ~120 BPM, got {result2:.1f}"
 
     print(f"  [OK] Tap tempo test passed (detected {result2:.1f} BPM)")
-    return True
 
 
 def test_set_bpm():
@@ -232,7 +232,6 @@ def test_set_bpm():
     assert pipeline._clock._tempo == 140.0, f"Expected 140 BPM, got {pipeline._clock._tempo}"
 
     print("  [OK] Set BPM test passed")
-    return True
 
 
 def test_barcode_roundtrip():
@@ -260,7 +259,6 @@ def test_barcode_roundtrip():
     assert decode_bpm(decoded.bpm_encoded) == 140.0, f"BPM: expected 140, got {decode_bpm(decoded.bpm_encoded)}"
 
     print("  [OK] Barcode roundtrip test passed")
-    return True
 
 
 def test_postprocessor_strip():
@@ -275,19 +273,18 @@ def test_postprocessor_strip():
     result = pipeline(video=[frame])
 
     assert "video" in result
-    video = result["video"]
+    video = _stack_video(result["video"])
     assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
 
-    # Bottom strip should be all black (0.0)
+    # Bottom strip should be all black (0)
     bottom = video[0, -barcode_h:, :, :]
-    assert bottom.max() == 0.0, f"Barcode region should be blacked out, got max={bottom.max()}"
+    assert bottom.max() == 0, f"Barcode region should be blacked out, got max={bottom.max()}"
 
     # Content above should NOT be all black
     content = video[0, :-barcode_h, :, :]
-    assert content.max() > 0.0, "Content region should have data"
+    assert content.max() > 0, "Content region should have data"
 
     print("  [OK] Postprocessor strip test passed")
-    return True
 
 
 def test_postprocessor_decode():
@@ -306,20 +303,19 @@ def test_postprocessor_decode():
     frame = torch.randint(64, 200, (1, 336, 576, 3), dtype=torch.uint8)
     pre_result = pre(video=[frame])
 
-    # The preprocessor output video has barcode stamped and is [0,1]
-    stamped = (pre_result["video"] * 255).to(torch.uint8)
+    # Preprocessor now returns list of uint8 tensors — use directly
+    stamped_video = pre_result["video"]
 
     # Run postprocessor in strip mode
     post_config = BpmStripConfig(buffer_mode="strip")
     post = BpmTimecodeStripPipeline(post_config)
-    post_result = post(video=[stamped])
+    post_result = post(video=stamped_video)
 
     assert "_bpm_buffer_output_meta" in post_result
     meta = post_result["_bpm_buffer_output_meta"]
     assert meta["decode_success"] > 0 or meta["decode_fail"] > 0, "No decode attempts"
 
     print(f"  [OK] Postprocessor decode test passed (success={meta['decode_success']}, fail={meta['decode_fail']})")
-    return True
 
 
 def test_postprocessor_latency_mode():
@@ -340,7 +336,6 @@ def test_postprocessor_latency_mode():
     assert meta["buffer_mode"] == "latency"
 
     print("  [OK] Postprocessor latency mode test passed")
-    return True
 
 
 if __name__ == "__main__":
