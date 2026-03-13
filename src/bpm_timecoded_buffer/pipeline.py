@@ -663,6 +663,37 @@ if _HAS_SCOPE:
                 is_load_param=False,
             ),
         )
+
+        beat_hold_beats: int = Field(
+            default=2,
+            ge=1,
+            le=16,
+            json_schema_extra=ui_field_config(
+                order=4,
+                label="Beat Hold Window",
+                is_load_param=False,
+            ),
+        )
+
+        loop_reset: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=5,
+                label="Reset Loop",
+                is_load_param=False,
+            ),
+        )
+
+        latency_nudge_ms: int = Field(
+            default=10,
+            ge=1,
+            le=100,
+            json_schema_extra=ui_field_config(
+                order=6,
+                label="Latency Nudge Step (ms)",
+                is_load_param=False,
+            ),
+        )
 else:
     class BpmStripConfig:
         """Standalone config for testing outside Scope."""
@@ -673,6 +704,9 @@ else:
             self.buffer_mode = kwargs.get("buffer_mode", "strip")
             self.loop_length_beats = kwargs.get("loop_length_beats", 8)
             self.latency_delay_ms = kwargs.get("latency_delay_ms", 100)
+            self.beat_hold_beats = kwargs.get("beat_hold_beats", 2)
+            self.loop_reset = kwargs.get("loop_reset", False)
+            self.latency_nudge_ms = kwargs.get("latency_nudge_ms", 10)
 
 
 # --- Buffered Frame ---
@@ -757,6 +791,16 @@ class BpmTimecodeStripPipeline(Pipeline):
         mode = str(getattr(self.config, "buffer_mode", "strip"))
         loop_len = getattr(self.config, "loop_length_beats", 8)
         latency_ms = getattr(self.config, "latency_delay_ms", 100)
+        beat_hold = getattr(self.config, "beat_hold_beats", 2)
+        loop_reset = getattr(self.config, "loop_reset", False)
+
+        # --- Loop reset trigger ---
+        if loop_reset:
+            self._loop_frames.clear()
+            self._loop_recording = True
+            self._loop_start_beat = None
+            self._loop_playhead = 0
+            logger.info("[BPM Buffer Output] Loop reset")
 
         # Stack frames
         frames = torch.cat(video, dim=0).float()  # (F, H, W, C), [0, 255]
@@ -799,7 +843,7 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # --- Apply buffer mode ---
         if mode == "beat":
-            output_frames = self._process_beat_quantized(incoming)
+            output_frames = self._process_beat_quantized(incoming, beat_hold)
         elif mode == "loop":
             output_frames = self._process_loop(incoming, loop_len)
         elif mode == "latency":
@@ -830,10 +874,13 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         return result
 
-    def _process_beat_quantized(self, incoming: list[_BufferedFrame]) -> list[np.ndarray]:
+    def _process_beat_quantized(
+        self, incoming: list[_BufferedFrame], hold_beats: int = 2
+    ) -> list[np.ndarray]:
         """
         Beat-quantized mode: buffer incoming frames, release the best frame
-        for each new whole beat boundary.
+        for each new whole beat boundary. hold_beats controls how many beats
+        of history to keep in the buffer (MIDI-mappable).
         """
         self._beat_buffer.extend(incoming)
 
@@ -852,10 +899,11 @@ class BpmTimecodeStripPipeline(Pipeline):
             output.append(best.frame)
             self._last_released_beat = current_whole
 
-            # Prune old frames (keep only frames from current beat onward)
+            # Prune old frames (keep only frames within hold window)
+            cutoff = current_whole - hold_beats
             self._beat_buffer = [
                 bf for bf in self._beat_buffer
-                if bf.beat >= current_whole - 1
+                if bf.beat >= cutoff
             ]
 
         if not output:
