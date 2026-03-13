@@ -677,10 +677,30 @@ if _HAS_SCOPE:
             ),
         )
 
-        loop_reset: bool = Field(
+        link_sync: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
                 order=5,
+                label="Ableton Link Sync",
+                is_load_param=False,
+            ),
+        )
+
+        link_bpm: float = Field(
+            default=120.0,
+            ge=20.0,
+            le=999.0,
+            json_schema_extra=ui_field_config(
+                order=6,
+                label="Link BPM (read-only when synced)",
+                is_load_param=False,
+            ),
+        )
+
+        loop_reset: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=7,
                 label="Reset Loop",
                 is_load_param=False,
             ),
@@ -691,7 +711,7 @@ if _HAS_SCOPE:
             ge=1,
             le=100,
             json_schema_extra=ui_field_config(
-                order=6,
+                order=8,
                 label="Latency Nudge Step (ms)",
                 is_load_param=False,
             ),
@@ -707,6 +727,8 @@ else:
             self.loop_length_beats = kwargs.get("loop_length_beats", 8)
             self.latency_delay_ms = kwargs.get("latency_delay_ms", 100)
             self.beat_hold_beats = kwargs.get("beat_hold_beats", 2)
+            self.link_sync = kwargs.get("link_sync", False)
+            self.link_bpm = kwargs.get("link_bpm", 120.0)
             self.loop_reset = kwargs.get("loop_reset", False)
             self.latency_nudge_ms = kwargs.get("latency_nudge_ms", 10)
 
@@ -761,6 +783,16 @@ class BpmTimecodeStripPipeline(Pipeline):
         )
         self.dtype = dtype if self.device.type == "cuda" else torch.float32
 
+        # Ableton Link clock for local sync
+        self._clock: Optional[LinkClock] = None
+        self._link_active = False
+
+        # Auto-start Link if config says so
+        link_sync = getattr(config, "link_sync", False)
+        if link_sync:
+            link_bpm = getattr(config, "link_bpm", 120.0)
+            self._start_link(link_bpm)
+
         # Beat-quantized buffer
         self._beat_buffer: list[_BufferedFrame] = []
         self._last_released_beat: int = -1
@@ -780,6 +812,27 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         logger.info("[BPM Buffer Output] Postprocessor initialized")
 
+    def _start_link(self, bpm: float = 120.0):
+        """Start Ableton Link clock for local beat sync."""
+        if self._clock is not None:
+            return
+        self._clock = LinkClock(bpm)
+        self._clock.start(bpm)
+        self._link_active = True
+        logger.info(f"[BPM Buffer Output] Ableton Link started at {bpm} BPM")
+
+    def _stop_link(self):
+        """Stop Ableton Link clock."""
+        if self._clock is not None:
+            self._clock.stop()
+            self._clock = None
+        self._link_active = False
+        logger.info("[BPM Buffer Output] Ableton Link stopped")
+
+    def __del__(self):
+        if hasattr(self, "_clock") and self._clock is not None:
+            self._clock.stop()
+
     def __call__(self, **kwargs) -> dict:
         """
         Decode barcode, strip it, and apply buffer mode.
@@ -797,6 +850,14 @@ class BpmTimecodeStripPipeline(Pipeline):
         latency_ms = getattr(self.config, "latency_delay_ms", 100)
         beat_hold = getattr(self.config, "beat_hold_beats", 2)
         loop_reset = getattr(self.config, "loop_reset", False)
+        link_sync = getattr(self.config, "link_sync", False)
+
+        # --- Ableton Link toggle ---
+        if link_sync and not self._link_active:
+            link_bpm = getattr(self.config, "link_bpm", 120.0)
+            self._start_link(link_bpm)
+        elif not link_sync and self._link_active:
+            self._stop_link()
 
         # --- Loop reset trigger ---
         if loop_reset:
@@ -837,10 +898,19 @@ class BpmTimecodeStripPipeline(Pipeline):
                 self._decode_fail += 1
                 # Still strip barcode even if decode fails
                 frame_np[-barcode_h:, :, :] = 0
+
+                # Use Link beat if available, otherwise fallback
+                if self._link_active and self._clock is not None:
+                    fallback_beat = self._clock.beat
+                    fallback_bpm = self._clock.tempo
+                else:
+                    fallback_beat = 0.0
+                    fallback_bpm = 120.0
+
                 incoming.append(_BufferedFrame(
                     frame=frame_np,
-                    beat=0.0,
-                    bpm=120.0,
+                    beat=fallback_beat,
+                    bpm=fallback_bpm,
                     frame_seq=0,
                     timestamp=now,
                 ))
@@ -874,6 +944,10 @@ class BpmTimecodeStripPipeline(Pipeline):
             "decode_fail": self._decode_fail,
             "buffer_mode": mode,
             "buffer_size": len(self._beat_buffer) + len(self._loop_frames) + len(self._latency_fifo),
+            "link_active": self._link_active,
+            "link_beat": self._clock.beat if self._clock else None,
+            "link_bpm": self._clock.tempo if self._clock else None,
+            "link_peers": self._clock.num_peers if self._clock else 0,
         }
 
         return result
@@ -885,6 +959,9 @@ class BpmTimecodeStripPipeline(Pipeline):
         Beat-quantized mode: buffer incoming frames, release the best frame
         for each new whole beat boundary. hold_beats controls how many beats
         of history to keep in the buffer (MIDI-mappable).
+
+        When Ableton Link is active, uses Link's beat position for timing
+        instead of decoded barcode beats — more reliable for local playback.
         """
         self._beat_buffer.extend(incoming)
 
@@ -892,7 +969,11 @@ class BpmTimecodeStripPipeline(Pipeline):
         if not self._beat_buffer:
             return [incoming[-1].frame] if incoming else []
 
-        latest_beat = max(bf.beat for bf in self._beat_buffer)
+        # Use Link beat if available for more accurate timing
+        if self._link_active and self._clock is not None:
+            latest_beat = self._clock.beat
+        else:
+            latest_beat = max(bf.beat for bf in self._beat_buffer)
         current_whole = int(latest_beat)
 
         output = []
@@ -921,14 +1002,20 @@ class BpmTimecodeStripPipeline(Pipeline):
     ) -> list[np.ndarray]:
         """
         Loop mode: record frames for N beats, then loop playback.
+        Uses Ableton Link beat when available for accurate loop boundaries.
         """
         if self._loop_recording:
             # Recording phase
             for bf in incoming:
-                if self._loop_start_beat is None:
-                    self._loop_start_beat = int(bf.beat)
+                # Use Link beat for loop timing if available
+                current_beat = bf.beat
+                if self._link_active and self._clock is not None:
+                    current_beat = self._clock.beat
 
-                beats_elapsed = bf.beat - self._loop_start_beat
+                if self._loop_start_beat is None:
+                    self._loop_start_beat = int(current_beat)
+
+                beats_elapsed = current_beat - self._loop_start_beat
                 if beats_elapsed < loop_length_beats:
                     self._loop_frames.append(bf)
                 else:
