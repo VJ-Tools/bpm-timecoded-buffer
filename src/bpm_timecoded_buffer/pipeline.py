@@ -870,17 +870,18 @@ class BpmTimecodeStripPipeline(Pipeline):
         if isinstance(video, list) and len(video) == 0:
             return {"video": torch.zeros(1, 1, 1, 3)}
 
-        barcode_h = getattr(self.config, "barcode_height", 16)
-        mode = str(getattr(self.config, "buffer_mode", "strip"))
-        loop_len = getattr(self.config, "loop_length_beats", 8)
-        latency_ms = getattr(self.config, "latency_delay_ms", 100)
-        beat_hold = getattr(self.config, "beat_hold_beats", 2)
-        loop_reset = getattr(self.config, "loop_reset", False)
-        link_sync = getattr(self.config, "link_sync", False)
+        # Read params from kwargs first (Scope runtime updates), fall back to config
+        barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
+        mode = str(kwargs.get("buffer_mode", getattr(self.config, "buffer_mode", "strip")))
+        loop_len = kwargs.get("loop_length_beats", getattr(self.config, "loop_length_beats", 8))
+        latency_ms = kwargs.get("latency_delay_ms", getattr(self.config, "latency_delay_ms", 100))
+        beat_hold = kwargs.get("beat_hold_beats", getattr(self.config, "beat_hold_beats", 2))
+        loop_reset = kwargs.get("loop_reset", getattr(self.config, "loop_reset", False))
+        link_sync = kwargs.get("link_sync", getattr(self.config, "link_sync", False))
 
         # --- Ableton Link toggle ---
         if link_sync and not self._link_active:
-            link_bpm = getattr(self.config, "link_bpm", 120.0)
+            link_bpm = kwargs.get("link_bpm", getattr(self.config, "link_bpm", 120.0))
             self._start_link(link_bpm)
         elif not link_sync and self._link_active:
             self._stop_link()
@@ -959,6 +960,15 @@ class BpmTimecodeStripPipeline(Pipeline):
         else:
             # strip mode: pass through with barcode stripped
             output_frames = [bf.frame for bf in incoming]
+
+        # Log every 100 frames for diagnostics
+        total = self._decode_success + self._decode_fail
+        if total % 100 == 1:
+            logger.info(
+                f"[BPM Buffer Output] mode={mode}, decode={self._decode_success}/{total}, "
+                f"link={self._link_active}, incoming={len(incoming)}, "
+                f"output={len(output_frames)}"
+            )
 
         # Convert back to tensor
         if not output_frames:
