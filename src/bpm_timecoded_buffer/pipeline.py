@@ -526,8 +526,10 @@ class BpmTimecodedBufferPipeline(Pipeline):
             )
 
         # --- 5. Display output ---
-        # Return as (F, H, W, C) float [0, 1] tensor — Scope calls output.shape[0]
-        display = frames_01.clone()  # already [0, 1]
+        # Scope pipeline_processor does: if dtype != uint8: value = (value * 255).clamp(0,255).uint8
+        # So we return [0, 1] float and let Scope handle the conversion.
+        frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
+        display = frames_01.clone()
         if strip_barcode:
             display[:, -barcode_h:, :, :] = 0.0
         else:
@@ -535,6 +537,11 @@ class BpmTimecodedBufferPipeline(Pipeline):
             mask_cpu = mask.unsqueeze(-1)  # (F, H, W, 1)
             preserve = 1.0 - mask_cpu
             display = (display + preserve * torch.tensor([0.0, 0.05, 0.0])).clamp(0.0, 1.0)
+
+        logger.info(
+            f"[BPM Buffer] Output: shape={display.shape}, dtype={display.dtype}, "
+            f"min={display.min():.3f}, max={display.max():.3f}, device={display.device}"
+        )
 
         result = {
             "video": display,
