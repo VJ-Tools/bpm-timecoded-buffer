@@ -376,11 +376,13 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
     def __init__(
         self,
-        config,
+        config=None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float16,
         **kwargs,  # Scope passes height, width, quantization, loras, etc.
     ):
+        if config is None:
+            config = BpmBufferConfig() if _HAS_SCOPE else type('Config', (), kwargs)()
         self.config = config
         self.device = (
             device if device is not None
@@ -745,11 +747,13 @@ class BpmTimecodeStripPipeline(Pipeline):
 
     def __init__(
         self,
-        config,
+        config=None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float16,
         **kwargs,  # Scope passes height, width, quantization, loras, etc.
     ):
+        if config is None:
+            config = BpmStripConfig() if _HAS_SCOPE else type('Config', (), kwargs)()
         self.config = config
         self.device = (
             device if device is not None
