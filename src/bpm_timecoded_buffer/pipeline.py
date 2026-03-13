@@ -208,17 +208,20 @@ if _HAS_SCOPE:
     class BpmBufferConfig(BasePipelineConfig):
         """Configuration schema for BPM Timecoded Buffer."""
 
-        pipeline_id: str = "bpm_timecoded_buffer"
-        pipeline_name: str = "BPM Timecoded Buffer (VJ.Tools)"
-        pipeline_description: str = (
+        # --- Class attributes (no type annotation = plain class var, not Pydantic field) ---
+        # Scope registry accesses these on the CLASS, not instances
+        pipeline_id = "bpm_timecoded_buffer"
+        pipeline_name = "BPM Timecoded Buffer (VJ.Tools)"
+        pipeline_description = (
             "Beat-grid timecoding via Ableton Link. Stamps barcode on input, "
             "preserves through AI via VACE masking. Client decodes surviving "
             "barcode on output for beat-accurate timing. "
             "Canny/Depth/Scribble control modes."
         )
-        supports_prompts: bool = False
+        supports_prompts = False
+        usage = [UsageType.PREPROCESSOR]
 
-        # --- Load-time parameters ---
+        # --- Load-time parameters (Pydantic fields with annotations) ---
 
         initial_bpm: float = Field(
             default=120.0,
@@ -303,8 +306,6 @@ if _HAS_SCOPE:
                 is_load_param=False,
             ),
         )
-
-        usage: list = [UsageType.PREPROCESSOR]
 else:
     class BpmBufferConfig:
         """Standalone config (no Pydantic) for testing outside Scope."""
@@ -567,15 +568,18 @@ if _HAS_SCOPE:
     class BpmStripConfig(BasePipelineConfig):
         """Configuration schema for BPM Timecode Strip (postprocessor)."""
 
-        pipeline_id: str = "bpm_timecode_strip"
-        pipeline_name: str = "BPM Timecode Strip (VJ.Tools)"
-        pipeline_description: str = (
+        # Class attributes (no annotation = not a Pydantic field)
+        pipeline_id = "bpm_timecode_strip"
+        pipeline_name = "BPM Timecode Strip (VJ.Tools)"
+        pipeline_description = (
             "Postprocessor that strips the timecode barcode from AI output. "
             "Blacks out the barcode strip so viewers don't see it. "
             "The barcode has already been read by the client at this point."
         )
-        supports_prompts: bool = False
+        supports_prompts = False
+        usage = [UsageType.POSTPROCESSOR]
 
+        # Pydantic fields
         barcode_height: int = Field(
             default=16,
             ge=4,
@@ -586,8 +590,6 @@ if _HAS_SCOPE:
                 is_load_param=False,
             ),
         )
-
-        usage: list = [UsageType.POSTPROCESSOR]
 else:
     class BpmStripConfig:
         """Standalone config for testing outside Scope."""
