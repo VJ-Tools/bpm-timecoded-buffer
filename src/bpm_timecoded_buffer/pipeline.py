@@ -226,7 +226,10 @@ if _HAS_SCOPE:
         supports_prompts = False
         modified = True
         usage = [UsageType.PREPROCESSOR]
-        modes = {"video": ModeDefaults(default=True)}
+        modes = {
+            "video": ModeDefaults(default=True),
+            "text": ModeDefaults(default=True),
+        }
 
         # --- Load-time parameters (Pydantic fields with annotations) ---
 
@@ -586,7 +589,10 @@ if _HAS_SCOPE:
         supports_prompts = False
         modified = True
         usage = [UsageType.POSTPROCESSOR]
-        modes = {"video": ModeDefaults(default=True)}
+        modes = {
+            "video": ModeDefaults(default=True),
+            "text": ModeDefaults(default=True),
+        }
 
         # Pydantic fields
         barcode_height: int = Field(
