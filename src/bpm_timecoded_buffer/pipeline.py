@@ -667,7 +667,7 @@ if _HAS_SCOPE:
         beat_hold_beats: int = Field(
             default=2,
             ge=1,
-            le=16,
+            le=64,
             json_schema_extra=ui_field_config(
                 order=4,
                 label="Beat Hold Window",
