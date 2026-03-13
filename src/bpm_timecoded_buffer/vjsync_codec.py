@@ -215,19 +215,30 @@ def unpack_payload(bits: np.ndarray) -> VJSyncPayload:
 
 # --- Encoder ---
 
+def _adaptive_bar_width(width: int) -> int:
+    """Compute bar width based on frame width. Minimum 1px per bar."""
+    return max(1, width // TOTAL_BARS)
+
+
 def encode_strip(payload: VJSyncPayload, width: int) -> np.ndarray:
     """
     Encode a VJSync payload into a barcode strip.
 
+    Bar width adapts to frame width:
+      - 512px+ → 6px bars (standard)
+      - 256px  → 3px bars
+      - 85px   → 1px bars (minimum)
+
     Returns: numpy array of shape (STRIP_HEIGHT, width, 3), dtype uint8
              with ITU-R limited range levels (16=black, 235=white)
     """
-    min_width = TOTAL_BARS * BAR_WIDTH
-    if width < min_width:
+    if width < TOTAL_BARS:
         raise ValueError(
-            f"Width {width} too narrow for {TOTAL_BARS} bars x {BAR_WIDTH}px. "
-            f"Need at least {min_width}px."
+            f"Width {width} too narrow for {TOTAL_BARS} bars. "
+            f"Need at least {TOTAL_BARS}px ({TOTAL_BARS} bars x 1px)."
         )
+
+    bar_width = _adaptive_bar_width(width)
 
     # 1. Pack payload -> 50 bits
     data_bits = pack_payload(payload)
@@ -245,8 +256,8 @@ def encode_strip(payload: VJSyncPayload, width: int) -> np.ndarray:
 
     for bar_idx in range(TOTAL_BARS):
         level = WHITE_LEVEL if bars[bar_idx] else BLACK_LEVEL
-        x_start = bar_idx * BAR_WIDTH
-        x_end = min(x_start + BAR_WIDTH, width)
+        x_start = bar_idx * bar_width
+        x_end = min(x_start + bar_width, width)
         strip[:, x_start:x_end, :] = level
 
     return strip
@@ -366,9 +377,10 @@ def _read_bar_values(strip: np.ndarray) -> Optional[np.ndarray]:
         Array of TOTAL_BARS bar values (0=black, 1=white), or None if unreadable
     """
     H, W, _ = strip.shape
-    min_width = TOTAL_BARS * BAR_WIDTH
-    if W < min_width:
+    if W < TOTAL_BARS:
         return None
+
+    bar_width = _adaptive_bar_width(W)
 
     # Average across height and channels for robustness
     scanline = strip.mean(axis=(0, 2))  # (W,)
@@ -378,7 +390,7 @@ def _read_bar_values(strip: np.ndarray) -> Optional[np.ndarray]:
     threshold = (BLACK_LEVEL + WHITE_LEVEL) / 2.0
 
     for i in range(TOTAL_BARS):
-        center = i * BAR_WIDTH + BAR_WIDTH // 2
+        center = i * bar_width + bar_width // 2
         if center < W:
             bars[i] = 1 if scanline[center] > threshold else 0
 

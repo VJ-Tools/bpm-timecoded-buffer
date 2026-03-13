@@ -454,7 +454,7 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
         # Handle both list and tensor input, or empty
         if isinstance(video, list) and len(video) == 0:
-            return {"video": torch.zeros(1, 1, 1, 3, dtype=torch.uint8)}
+            return {"video": torch.zeros(1, 1, 1, 3)}
 
         # --- Test pattern override ---
         if test_input:
@@ -525,21 +525,19 @@ class BpmTimecodedBufferPipeline(Pipeline):
                 frames_stamped, barcode_h, control_mode, canny_low, canny_high
             )
 
-        # --- 5. Display output (keep in [0, 255] uint8 to match Scope's input format) ---
-        display = frames_stamped.clone()  # (F, H, W, C), [0, 255] float
+        # --- 5. Display output ---
+        # Return as (F, H, W, C) float [0, 1] tensor — Scope calls output.shape[0]
+        display = frames_01.clone()  # already [0, 1]
         if strip_barcode:
             display[:, -barcode_h:, :, :] = 0.0
         else:
             # Show barcode with subtle green tint so you can verify it survives
             mask_cpu = mask.unsqueeze(-1)  # (F, H, W, 1)
             preserve = 1.0 - mask_cpu
-            display = (display + preserve * torch.tensor([0.0, 12.0, 0.0])).clamp(0.0, 255.0)
-
-        # Return as (F, H, W, C) uint8 tensor — Scope calls output.shape[0]
-        display_uint8 = display.to(torch.uint8)
+            display = (display + preserve * torch.tensor([0.0, 0.05, 0.0])).clamp(0.0, 1.0)
 
         result = {
-            "video": display_uint8,
+            "video": display,
             "vace_input_frames": vace_frames,
             "vace_input_masks": vace_mask,
         }
@@ -847,7 +845,7 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # Handle both list and tensor input, or empty
         if isinstance(video, list) and len(video) == 0:
-            return {"video": torch.zeros(1, 1, 1, 3, dtype=torch.uint8)}
+            return {"video": torch.zeros(1, 1, 1, 3)}
 
         barcode_h = getattr(self.config, "barcode_height", 16)
         mode = str(getattr(self.config, "buffer_mode", "strip"))
@@ -877,6 +875,11 @@ class BpmTimecodeStripPipeline(Pipeline):
             frames = torch.cat(video, dim=0).float()
         else:
             frames = video.float() if video.dim() == 4 else video.unsqueeze(0).float()
+
+        # Auto-detect [0,1] vs [0,255] range and normalize to [0,255]
+        if frames.max() <= 1.0:
+            frames = frames * 255.0
+
         F, H, W, C = frames.shape
         barcode_h = min(barcode_h, H // 4)
         now = time.monotonic()
@@ -939,7 +942,7 @@ class BpmTimecodeStripPipeline(Pipeline):
             output_frames = [incoming[0].frame] if incoming else [np.zeros((H, W, C), dtype=np.uint8)]
 
         out_np = np.stack(output_frames, axis=0)  # (F, H, W, C)
-        out_tensor = torch.from_numpy(out_np).to(torch.uint8)
+        out_tensor = torch.from_numpy(out_np).float() / 255.0  # [0, 1] float
 
         result = {"video": out_tensor}
 
