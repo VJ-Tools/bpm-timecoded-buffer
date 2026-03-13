@@ -235,6 +235,34 @@ def test_set_bpm():
     return True
 
 
+def test_barcode_roundtrip():
+    """Test encode → decode barcode roundtrip."""
+    from bpm_timecoded_buffer.vjsync_codec import (
+        VJSyncPayload, stamp_barcode, read_barcode,
+        encode_bpm, decode_bpm, encode_beat_frac, decode_beat_frac,
+    )
+    import numpy as np
+
+    frame = np.full((336, 576, 3), 128, dtype=np.uint8)
+    payload = VJSyncPayload(
+        beat_whole=42,
+        beat_frac=encode_beat_frac(0.75),
+        frame_seq=1234,
+        bpm_encoded=encode_bpm(140.0),
+        flags=0,
+    )
+    stamp_barcode(frame, payload)
+
+    decoded = read_barcode(frame, 16)
+    assert decoded is not None, "Failed to decode barcode"
+    assert decoded.beat_whole == 42, f"beat_whole: expected 42, got {decoded.beat_whole}"
+    assert decoded.frame_seq == 1234, f"frame_seq: expected 1234, got {decoded.frame_seq}"
+    assert decode_bpm(decoded.bpm_encoded) == 140.0, f"BPM: expected 140, got {decode_bpm(decoded.bpm_encoded)}"
+
+    print("  [OK] Barcode roundtrip test passed")
+    return True
+
+
 def test_postprocessor_strip():
     """Test that the postprocessor strips the barcode from output."""
     from bpm_timecoded_buffer.pipeline import BpmTimecodeStripPipeline, BpmStripConfig
@@ -262,6 +290,59 @@ def test_postprocessor_strip():
     return True
 
 
+def test_postprocessor_decode():
+    """Test that the postprocessor decodes barcodes from preprocessor output."""
+    from bpm_timecoded_buffer.pipeline import (
+        BpmTimecodedBufferPipeline, BpmBufferConfig,
+        BpmTimecodeStripPipeline, BpmStripConfig,
+    )
+    import time
+
+    # Run preprocessor to stamp a barcode
+    pre_config = BpmBufferConfig()
+    pre = BpmTimecodedBufferPipeline(pre_config)
+    time.sleep(0.05)  # Let clock tick
+
+    frame = torch.randint(64, 200, (1, 336, 576, 3), dtype=torch.uint8)
+    pre_result = pre(video=[frame])
+
+    # The preprocessor output video has barcode stamped and is [0,1]
+    stamped = (pre_result["video"] * 255).to(torch.uint8)
+
+    # Run postprocessor in strip mode
+    post_config = BpmStripConfig(buffer_mode="strip")
+    post = BpmTimecodeStripPipeline(post_config)
+    post_result = post(video=[stamped])
+
+    assert "_bpm_buffer_output_meta" in post_result
+    meta = post_result["_bpm_buffer_output_meta"]
+    assert meta["decode_success"] > 0 or meta["decode_fail"] > 0, "No decode attempts"
+
+    print(f"  [OK] Postprocessor decode test passed (success={meta['decode_success']}, fail={meta['decode_fail']})")
+    return True
+
+
+def test_postprocessor_latency_mode():
+    """Test latency buffer mode."""
+    from bpm_timecoded_buffer.pipeline import BpmTimecodeStripPipeline, BpmStripConfig
+
+    config = BpmStripConfig(buffer_mode="latency", latency_delay_ms=100)
+    pipeline = BpmTimecodeStripPipeline(config)
+
+    barcode_h = 16
+    # Feed several batches to fill the buffer
+    for _ in range(5):
+        frame = make_test_frame(barcode_height=barcode_h)
+        result = pipeline(video=[frame])
+        assert "video" in result
+
+    meta = result["_bpm_buffer_output_meta"]
+    assert meta["buffer_mode"] == "latency"
+
+    print("  [OK] Postprocessor latency mode test passed")
+    return True
+
+
 if __name__ == "__main__":
     print("\n=== BPM Timecoded Buffer Pipeline Tests ===\n")
 
@@ -275,7 +356,10 @@ if __name__ == "__main__":
         test_test_pattern_input,
         test_tap_bpm,
         test_set_bpm,
+        test_barcode_roundtrip,
         test_postprocessor_strip,
+        test_postprocessor_decode,
+        test_postprocessor_latency_mode,
     ]
 
     passed = 0

@@ -26,6 +26,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -38,7 +39,10 @@ from .vjsync_codec import (
     STRIP_HEIGHT,
     encode_bpm,
     encode_beat_frac,
+    decode_bpm,
+    decode_beat_frac,
     stamp_barcode,
+    read_barcode,
 )
 from .test_source import TestPatternSource
 
@@ -205,6 +209,13 @@ class ControlMode(str, Enum):
     CANNY = "canny"
     DEPTH = "depth"
     SCRIBBLE = "scribble"
+
+
+class BufferMode(str, Enum):
+    STRIP = "strip"          # Just strip barcode (simplest)
+    BEAT = "beat"            # Beat-quantized: release frames on beat boundaries
+    LOOP = "loop"            # Loop collection: record N beats, loop playback
+    LATENCY = "latency"      # Adjustable latency: FIFO buffer to smooth jitter
 
 
 # --- Config ---
@@ -592,15 +603,15 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
 if _HAS_SCOPE:
     class BpmStripConfig(BasePipelineConfig):
-        """Configuration schema for BPM Timecode Strip (postprocessor)."""
+        """Configuration schema for BPM Timecoded Buffer postprocessor."""
 
         # Class attributes (no annotation = not a Pydantic field)
         pipeline_id = "bpm_timecode_strip"
-        pipeline_name = "BPM Timecode Strip (VJ.Tools)"
+        pipeline_name = "BPM Timecode Buffer Output (VJ.Tools)"
         pipeline_description = (
-            "Postprocessor that strips the timecode barcode from AI output. "
-            "Blacks out the barcode strip so viewers don't see it. "
-            "The barcode has already been read by the client at this point."
+            "Postprocessor that decodes timecode barcodes from AI output and "
+            "provides beat-quantized, loop, or latency-compensated buffering. "
+            "Strips the barcode from output so viewers don't see it."
         )
         supports_prompts = False
         modified = True
@@ -621,25 +632,77 @@ if _HAS_SCOPE:
                 is_load_param=False,
             ),
         )
+
+        buffer_mode: BufferMode = Field(
+            default=BufferMode.STRIP,
+            json_schema_extra=ui_field_config(
+                order=1,
+                label="Buffer Mode",
+                is_load_param=False,
+            ),
+        )
+
+        loop_length_beats: int = Field(
+            default=8,
+            ge=1,
+            le=64,
+            json_schema_extra=ui_field_config(
+                order=2,
+                label="Loop Length (beats)",
+                is_load_param=False,
+            ),
+        )
+
+        latency_delay_ms: int = Field(
+            default=100,
+            ge=0,
+            le=2000,
+            json_schema_extra=ui_field_config(
+                order=3,
+                label="Latency Buffer (ms)",
+                is_load_param=False,
+            ),
+        )
 else:
     class BpmStripConfig:
         """Standalone config for testing outside Scope."""
         def __init__(self, **kwargs):
             self.pipeline_id = kwargs.get("pipeline_id", "bpm_timecode_strip")
-            self.pipeline_name = kwargs.get("pipeline_name", "BPM Timecode Strip (VJ.Tools)")
+            self.pipeline_name = kwargs.get("pipeline_name", "BPM Timecode Buffer Output (VJ.Tools)")
             self.barcode_height = kwargs.get("barcode_height", 16)
+            self.buffer_mode = kwargs.get("buffer_mode", "strip")
+            self.loop_length_beats = kwargs.get("loop_length_beats", 8)
+            self.latency_delay_ms = kwargs.get("latency_delay_ms", 100)
+
+
+# --- Buffered Frame ---
+
+@dataclass
+class _BufferedFrame:
+    """A decoded frame with its timecode metadata."""
+    frame: np.ndarray        # (H, W, C) uint8, barcode stripped
+    beat: float              # decoded beat position
+    bpm: float               # decoded BPM
+    frame_seq: int           # decoded frame sequence number
+    timestamp: float         # time.monotonic() when received
 
 
 # --- Postprocessor Pipeline ---
 
 class BpmTimecodeStripPipeline(Pipeline):
     """
-    Scope postprocessor that strips the timecode barcode from AI output.
+    Scope postprocessor that decodes timecode barcodes from AI output,
+    strips the barcode, and optionally buffers frames for beat-accurate
+    playback.
 
-    After AI generation, the barcode strip has already been preserved via VACE
-    masking. The client has already read/decoded the barcode from the WebRTC
-    output. This postprocessor blacks out the barcode region so viewers don't
-    see it in the final output.
+    Buffer modes:
+      - strip:   Just strip the barcode (pass-through, simplest)
+      - beat:    Beat-quantized — hold frames until the next beat boundary,
+                 then release the frame closest to that beat
+      - loop:    Loop collection — record N beats of frames into a loop,
+                 then cycle playback beat-synced
+      - latency: Adjustable latency — FIFO buffer with configurable delay
+                 to smooth out variable inference jitter
     """
 
     @classmethod
@@ -660,16 +723,30 @@ class BpmTimecodeStripPipeline(Pipeline):
         )
         self.dtype = dtype if self.device.type == "cuda" else torch.float32
 
-        logger.info("[BPM Strip] Postprocessor initialized")
+        # Beat-quantized buffer
+        self._beat_buffer: list[_BufferedFrame] = []
+        self._last_released_beat: int = -1
+
+        # Loop buffer
+        self._loop_frames: list[_BufferedFrame] = []
+        self._loop_recording: bool = True
+        self._loop_start_beat: Optional[int] = None
+        self._loop_playhead: int = 0
+
+        # Latency FIFO
+        self._latency_fifo: list[_BufferedFrame] = []
+
+        # Stats
+        self._decode_success = 0
+        self._decode_fail = 0
+
+        logger.info("[BPM Buffer Output] Postprocessor initialized")
 
     def __call__(self, **kwargs) -> dict:
         """
-        Strip barcode from AI output frames.
+        Decode barcode, strip it, and apply buffer mode.
 
         Scope passes video as kwargs["video"] — a list of (1, H, W, C) uint8 tensors.
-
-        Returns:
-            dict with video (barcode region blacked out)
         """
         video = kwargs.get("video", [])
 
@@ -677,16 +754,185 @@ class BpmTimecodeStripPipeline(Pipeline):
             return {"video": torch.zeros(1, 1, 1, 3)}
 
         barcode_h = getattr(self.config, "barcode_height", 16)
+        mode = str(getattr(self.config, "buffer_mode", "strip"))
+        loop_len = getattr(self.config, "loop_length_beats", 8)
+        latency_ms = getattr(self.config, "latency_delay_ms", 100)
 
         # Stack frames
         frames = torch.cat(video, dim=0).float()  # (F, H, W, C), [0, 255]
         F, H, W, C = frames.shape
         barcode_h = min(barcode_h, H // 4)
+        now = time.monotonic()
 
-        # Black out the barcode strip
-        frames[:, -barcode_h:, :, :] = 0.0
+        # --- Decode barcodes and build buffered frames ---
+        incoming: list[_BufferedFrame] = []
+        for f_idx in range(F):
+            frame_np = frames[f_idx].cpu().numpy().astype(np.uint8)
+            payload = read_barcode(frame_np, barcode_h)
 
-        # Normalize to [0, 1] for display
-        display = frames / 255.0
+            if payload is not None:
+                self._decode_success += 1
+                beat = payload.beat_whole + decode_beat_frac(payload.beat_frac)
+                bpm = decode_bpm(payload.bpm_encoded)
 
-        return {"video": display.cpu()}
+                # Strip barcode
+                frame_np[-barcode_h:, :, :] = 0
+
+                incoming.append(_BufferedFrame(
+                    frame=frame_np,
+                    beat=beat,
+                    bpm=bpm,
+                    frame_seq=payload.frame_seq,
+                    timestamp=now,
+                ))
+            else:
+                self._decode_fail += 1
+                # Still strip barcode even if decode fails
+                frame_np[-barcode_h:, :, :] = 0
+                incoming.append(_BufferedFrame(
+                    frame=frame_np,
+                    beat=0.0,
+                    bpm=120.0,
+                    frame_seq=0,
+                    timestamp=now,
+                ))
+
+        # --- Apply buffer mode ---
+        if mode == "beat":
+            output_frames = self._process_beat_quantized(incoming)
+        elif mode == "loop":
+            output_frames = self._process_loop(incoming, loop_len)
+        elif mode == "latency":
+            output_frames = self._process_latency(incoming, latency_ms)
+        else:
+            # strip mode: pass through with barcode stripped
+            output_frames = [bf.frame for bf in incoming]
+
+        # Convert back to tensor
+        if not output_frames:
+            output_frames = [incoming[0].frame] if incoming else [np.zeros((H, W, C), dtype=np.uint8)]
+
+        out_np = np.stack(output_frames, axis=0)  # (F, H, W, C)
+        display = torch.from_numpy(out_np).float() / 255.0
+
+        result = {"video": display.cpu()}
+
+        # Diagnostics
+        total = self._decode_success + self._decode_fail
+        rate = self._decode_success / total if total > 0 else 0.0
+        result["_bpm_buffer_output_meta"] = {
+            "decode_rate": rate,
+            "decode_success": self._decode_success,
+            "decode_fail": self._decode_fail,
+            "buffer_mode": mode,
+            "buffer_size": len(self._beat_buffer) + len(self._loop_frames) + len(self._latency_fifo),
+        }
+
+        return result
+
+    def _process_beat_quantized(self, incoming: list[_BufferedFrame]) -> list[np.ndarray]:
+        """
+        Beat-quantized mode: buffer incoming frames, release the best frame
+        for each new whole beat boundary.
+        """
+        self._beat_buffer.extend(incoming)
+
+        # Find the latest beat in the buffer
+        if not self._beat_buffer:
+            return [incoming[-1].frame] if incoming else []
+
+        latest_beat = max(bf.beat for bf in self._beat_buffer)
+        current_whole = int(latest_beat)
+
+        output = []
+        if current_whole > self._last_released_beat:
+            # New beat boundary — find the frame closest to this beat
+            target = float(current_whole)
+            best = min(self._beat_buffer, key=lambda bf: abs(bf.beat - target))
+            output.append(best.frame)
+            self._last_released_beat = current_whole
+
+            # Prune old frames (keep only frames from current beat onward)
+            self._beat_buffer = [
+                bf for bf in self._beat_buffer
+                if bf.beat >= current_whole - 1
+            ]
+
+        if not output:
+            # No new beat yet — hold last frame
+            output.append(self._beat_buffer[-1].frame)
+
+        return output
+
+    def _process_loop(
+        self, incoming: list[_BufferedFrame], loop_length_beats: int
+    ) -> list[np.ndarray]:
+        """
+        Loop mode: record frames for N beats, then loop playback.
+        """
+        if self._loop_recording:
+            # Recording phase
+            for bf in incoming:
+                if self._loop_start_beat is None:
+                    self._loop_start_beat = int(bf.beat)
+
+                beats_elapsed = bf.beat - self._loop_start_beat
+                if beats_elapsed < loop_length_beats:
+                    self._loop_frames.append(bf)
+                else:
+                    # Done recording
+                    self._loop_recording = False
+                    logger.info(
+                        f"[BPM Buffer Output] Loop recorded: {len(self._loop_frames)} "
+                        f"frames over {loop_length_beats} beats"
+                    )
+                    break
+
+            if self._loop_recording:
+                # Still recording — pass through
+                return [bf.frame for bf in incoming]
+
+        # Playback phase — cycle through recorded frames
+        if not self._loop_frames:
+            return [bf.frame for bf in incoming]
+
+        output = []
+        for _ in incoming:
+            idx = self._loop_playhead % len(self._loop_frames)
+            output.append(self._loop_frames[idx].frame)
+            self._loop_playhead += 1
+
+        return output
+
+    def _process_latency(
+        self, incoming: list[_BufferedFrame], delay_ms: int
+    ) -> list[np.ndarray]:
+        """
+        Latency compensation mode: FIFO buffer with configurable delay.
+        Smooths out variable inference latency for consistent output timing.
+        """
+        self._latency_fifo.extend(incoming)
+
+        # Calculate how many frames the delay corresponds to
+        # Use latest BPM to estimate frame rate (Scope typically runs ~30fps)
+        fps_estimate = 30.0
+        delay_frames = max(1, int((delay_ms / 1000.0) * fps_estimate))
+
+        output = []
+        while len(self._latency_fifo) > delay_frames:
+            bf = self._latency_fifo.pop(0)
+            output.append(bf.frame)
+
+        if not output:
+            # Buffer not full yet — output oldest available
+            if self._latency_fifo:
+                output.append(self._latency_fifo[0].frame)
+            else:
+                output.append(incoming[-1].frame)
+
+        # Cap FIFO size to prevent memory growth
+        max_fifo = delay_frames * 3
+        if len(self._latency_fifo) > max_fifo:
+            self._latency_fifo = self._latency_fifo[-delay_frames:]
+
+        return output

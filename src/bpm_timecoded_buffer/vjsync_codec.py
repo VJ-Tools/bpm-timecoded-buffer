@@ -288,3 +288,150 @@ def encode_beat_frac(frac: float) -> int:
 def decode_beat_frac(encoded: int) -> float:
     """Convert 8-bit value back to fractional beat (0-1)."""
     return encoded / 255.0
+
+
+# --- BCH Verification & Decode ---
+
+def bch_verify(received: np.ndarray) -> bool:
+    """
+    Verify a received codeword by re-encoding the data portion
+    and comparing to the received ECC bits.
+
+    This is simpler than syndrome decoding and always correct.
+    """
+    if len(received) != BCH_N:
+        return False
+    data = received[:BCH_K]
+    expected = bch_encode(data)
+    return np.array_equal(received, expected)
+
+
+def bch_decode(received: np.ndarray) -> tuple[Optional[np.ndarray], int]:
+    """
+    BCH decode: verify and extract data bits from 71-bit received codeword.
+
+    For clean signals (no bit errors), verifies the ECC matches and returns data.
+    For up to BCH_T bit errors, attempts brute-force correction.
+
+    Returns:
+        (corrected_data_bits, num_errors) — corrected 50 data bits and error count.
+        If uncorrectable, returns (None, -1).
+    """
+    assert len(received) == BCH_N, f"BCH decode expects {BCH_N} bits, got {len(received)}"
+
+    # Fast path: no errors
+    if bch_verify(received):
+        return received[:BCH_K].copy(), 0
+
+    # Try single-bit error correction (brute force, fast for n=71)
+    for i in range(BCH_N):
+        trial = received.copy()
+        trial[i] ^= 1
+        if bch_verify(trial):
+            return trial[:BCH_K].copy(), 1
+
+    # Try double-bit error correction
+    for i in range(BCH_N):
+        for j in range(i + 1, BCH_N):
+            trial = received.copy()
+            trial[i] ^= 1
+            trial[j] ^= 1
+            if bch_verify(trial):
+                return trial[:BCH_K].copy(), 2
+
+    # Triple-bit correction is O(n^3) = ~60K iterations, still feasible for n=71
+    for i in range(BCH_N):
+        for j in range(i + 1, BCH_N):
+            for k in range(j + 1, BCH_N):
+                trial = received.copy()
+                trial[i] ^= 1
+                trial[j] ^= 1
+                trial[k] ^= 1
+                if bch_verify(trial):
+                    return trial[:BCH_K].copy(), 3
+
+    return None, -1
+
+
+# --- Barcode Reader ---
+
+def _read_bar_values(strip: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Read bar values (0 or 1) from a barcode strip image.
+
+    Args:
+        strip: numpy array (H, W, 3), dtype uint8 — the bottom strip of a frame
+
+    Returns:
+        Array of TOTAL_BARS bar values (0=black, 1=white), or None if unreadable
+    """
+    H, W, _ = strip.shape
+    min_width = TOTAL_BARS * BAR_WIDTH
+    if W < min_width:
+        return None
+
+    # Average across height and channels for robustness
+    scanline = strip.mean(axis=(0, 2))  # (W,)
+
+    # Read each bar by sampling center of the bar
+    bars = np.zeros(TOTAL_BARS, dtype=np.uint8)
+    threshold = (BLACK_LEVEL + WHITE_LEVEL) / 2.0
+
+    for i in range(TOTAL_BARS):
+        center = i * BAR_WIDTH + BAR_WIDTH // 2
+        if center < W:
+            bars[i] = 1 if scanline[center] > threshold else 0
+
+    return bars
+
+
+def _verify_sync(bars: np.ndarray) -> bool:
+    """Check if the sync pattern matches."""
+    sync = bars[:SYNC_BARS]
+    expected = np.array(SYNC_PATTERN, dtype=np.uint8)
+    return np.array_equal(sync, expected)
+
+
+def decode_strip(strip: np.ndarray) -> Optional[VJSyncPayload]:
+    """
+    Decode a VJSync barcode from a strip image.
+
+    Args:
+        strip: numpy array (H, W, 3), dtype uint8 — the barcode strip region
+
+    Returns:
+        VJSyncPayload if successfully decoded, None otherwise
+    """
+    bars = _read_bar_values(strip)
+    if bars is None:
+        return None
+
+    if not _verify_sync(bars):
+        return None
+
+    # Extract data bits (after sync)
+    received = bars[SYNC_BARS:]
+    assert len(received) == DATA_BARS
+
+    # BCH decode
+    corrected, num_errors = bch_decode(received)
+    if corrected is None:
+        return None
+
+    return unpack_payload(corrected)
+
+
+def read_barcode(frame: np.ndarray, barcode_height: int = STRIP_HEIGHT) -> Optional[VJSyncPayload]:
+    """
+    Read a VJSync barcode from the bottom of a frame.
+
+    Args:
+        frame: numpy array (H, W, 3), dtype uint8
+        barcode_height: height of the barcode strip in pixels
+
+    Returns:
+        VJSyncPayload if successfully decoded, None otherwise
+    """
+    H, W, _ = frame.shape
+    strip = frame[-barcode_height:, :, :]
+    return decode_strip(strip)
