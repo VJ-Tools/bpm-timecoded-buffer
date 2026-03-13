@@ -48,7 +48,7 @@ from .test_source import TestPatternSource
 
 # --- Scope imports: match actual Scope package structure ---
 try:
-    from scope.core.pipelines.interface import Pipeline
+    from scope.core.pipelines.interface import Pipeline, Requirements
     from scope.core.pipelines.base_schema import (
         BasePipelineConfig, UsageType, ModeDefaults, ui_field_config,
     )
@@ -57,6 +57,9 @@ except ImportError:
     # Fallback for running outside Scope (standalone tests)
     class Pipeline:
         pass
+    class Requirements:
+        def __init__(self, input_size: int = 1):
+            self.input_size = input_size
     class BasePipelineConfig:
         pass
     class UsageType:
@@ -428,6 +431,10 @@ class BpmTimecodedBufferPipeline(Pipeline):
         if self._test_source:
             self._test_source.set_bpm(bpm)
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
+
+    def prepare(self, **kwargs) -> "Requirements":
+        """Tell Scope how many input frames we need per call."""
+        return Requirements(input_size=1)
 
     def __call__(self, **kwargs) -> dict:
         """
@@ -841,6 +848,10 @@ class BpmTimecodeStripPipeline(Pipeline):
     def __del__(self):
         if hasattr(self, "_clock") and self._clock is not None:
             self._clock.stop()
+
+    def prepare(self, **kwargs) -> "Requirements":
+        """Tell Scope how many input frames we need per call."""
+        return Requirements(input_size=1)
 
     def __call__(self, **kwargs) -> dict:
         """
