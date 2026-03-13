@@ -550,11 +550,16 @@ class BpmTimecodedBufferPipeline(Pipeline):
             f"min={display.min():.3f}, max={display.max():.3f}, device={display.device}"
         )
 
-        result = {
-            "video": display,
-            "vace_input_frames": vace_frames,
-            "vace_input_masks": vace_mask,
-        }
+        result = {"video": display}
+
+        # Only forward VACE tensors when the downstream pipeline supports VACE.
+        # Scope sets vace_enabled=True in kwargs when the frontend has VACE mode on.
+        # If we always forward these, they poison the downstream call_params and
+        # prevent video from being assigned (pipeline_processor skips video assignment
+        # when vace_input_frames is already in call_params).
+        if kwargs.get("vace_enabled", False):
+            result["vace_input_frames"] = vace_frames
+            result["vace_input_masks"] = vace_mask
 
         if control_video is not None:
             result["control_video"] = control_video

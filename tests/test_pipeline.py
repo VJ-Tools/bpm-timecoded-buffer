@@ -40,7 +40,7 @@ def test_basic_mask():
     pipeline = BpmTimecodedBufferPipeline(config)
 
     frame = make_test_frame()
-    result = pipeline(video=[frame], barcode_height=16, control_mode="none")
+    result = pipeline(video=[frame], barcode_height=16, control_mode="none", vace_enabled=True)
 
     assert "video" in result
     assert "vace_input_frames" in result
@@ -61,6 +61,23 @@ def test_basic_mask():
     print("  [OK] Basic mask test passed")
 
 
+def test_basic_no_vace():
+    """Test that without vace_enabled, VACE keys are NOT in the result."""
+    from bpm_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
+
+    config = BpmBufferConfig()
+    pipeline = BpmTimecodedBufferPipeline(config)
+
+    frame = make_test_frame()
+    result = pipeline(video=[frame], barcode_height=16, control_mode="none")
+
+    assert "video" in result
+    assert "vace_input_frames" not in result
+    assert "vace_input_masks" not in result
+
+    print("  [OK] Basic no-VACE test passed")
+
+
 def test_barcode_preserved():
     """Test that the barcode region has mask=0 (preserve)."""
     from bpm_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
@@ -70,7 +87,7 @@ def test_barcode_preserved():
 
     barcode_h = 16
     frame = make_test_frame(barcode_height=barcode_h)
-    result = pipeline(video=[frame], barcode_height=barcode_h, control_mode="none")
+    result = pipeline(video=[frame], barcode_height=barcode_h, control_mode="none", vace_enabled=True)
 
     vace_masks = result["vace_input_masks"]
     barcode_mask = vace_masks[0, 0, 0, -barcode_h:, :]
@@ -91,7 +108,7 @@ def test_barcode_in_vace_frames():
 
     barcode_h = 16
     frame = make_test_frame(barcode_height=barcode_h)
-    result = pipeline(video=[frame], barcode_height=barcode_h, control_mode="none")
+    result = pipeline(video=[frame], barcode_height=barcode_h, control_mode="none", vace_enabled=True)
 
     vace_frames = result["vace_input_frames"]
     barcode_region = vace_frames[0, :, 0, -barcode_h:, :]
@@ -111,7 +128,7 @@ def test_control_modes():
 
     for mode in ["none", "canny", "depth", "scribble"]:
         frame = make_test_frame()
-        result = pipeline(video=[frame], barcode_height=16, control_mode=mode)
+        result = pipeline(video=[frame], barcode_height=16, control_mode=mode, vace_enabled=True)
 
         assert "video" in result
         assert "vace_input_masks" in result
@@ -132,7 +149,7 @@ def test_multi_frame():
     pipeline = BpmTimecodedBufferPipeline(config)
 
     frames = [make_test_frame() for _ in range(4)]
-    result = pipeline(video=frames, barcode_height=16, control_mode="none")
+    result = pipeline(video=frames, barcode_height=16, control_mode="none", vace_enabled=True)
 
     video = _stack_video(result["video"])
     assert video.shape[0] == 4
@@ -164,7 +181,7 @@ def test_strip_barcode():
     # strip_barcode=True: barcode blacked out in display
     result_stripped = pipeline(
         video=[frame], barcode_height=barcode_h, control_mode="none",
-        strip_barcode=True,
+        strip_barcode=True, vace_enabled=True,
     )
     vid_stripped = _stack_video(result_stripped["video"])
     bottom_stripped = vid_stripped[0, -barcode_h:, :, :].numpy()
@@ -187,7 +204,8 @@ def test_test_pattern_input():
 
     frame = make_test_frame()
     result = pipeline(
-        video=[frame], barcode_height=16, control_mode="none", test_input=True
+        video=[frame], barcode_height=16, control_mode="none", test_input=True,
+        vace_enabled=True,
     )
 
     assert "video" in result
@@ -343,6 +361,7 @@ if __name__ == "__main__":
 
     tests = [
         test_basic_mask,
+        test_basic_no_vace,
         test_barcode_preserved,
         test_barcode_in_vace_frames,
         test_control_modes,
