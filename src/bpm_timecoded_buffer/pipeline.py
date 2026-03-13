@@ -45,7 +45,9 @@ from .test_source import TestPatternSource
 # --- Scope imports: match actual Scope package structure ---
 try:
     from scope.core.pipelines.interface import Pipeline
-    from scope.core.pipelines.base_schema import BasePipelineConfig, UsageType, ui_field_config
+    from scope.core.pipelines.base_schema import (
+        BasePipelineConfig, UsageType, ModeDefaults, ui_field_config,
+    )
     _HAS_SCOPE = True
 except ImportError:
     # Fallback for running outside Scope (standalone tests)
@@ -56,6 +58,9 @@ except ImportError:
     class UsageType:
         PREPROCESSOR = "preprocessor"
         POSTPROCESSOR = "postprocessor"
+    class ModeDefaults:
+        def __init__(self, default=False):
+            self.default = default
     def ui_field_config(**kwargs):
         return kwargs
     _HAS_SCOPE = False
@@ -219,7 +224,9 @@ if _HAS_SCOPE:
             "Canny/Depth/Scribble control modes."
         )
         supports_prompts = False
+        modified = True
         usage = [UsageType.PREPROCESSOR]
+        modes = {"video": ModeDefaults(default=True)}
 
         # --- Load-time parameters (Pydantic fields with annotations) ---
 
@@ -577,7 +584,9 @@ if _HAS_SCOPE:
             "The barcode has already been read by the client at this point."
         )
         supports_prompts = False
+        modified = True
         usage = [UsageType.POSTPROCESSOR]
+        modes = {"video": ModeDefaults(default=True)}
 
         # Pydantic fields
         barcode_height: int = Field(
