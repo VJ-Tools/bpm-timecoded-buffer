@@ -5,7 +5,6 @@ Preprocessor that:
 1. Joins an Ableton Link session for a shared beat clock
 2. Stamps a VJSync barcode on each input frame (encoding current beat position)
 3. Creates a VACE inpainting mask that preserves the barcode through AI generation
-4. Optionally applies ControlNet preprocessing (canny, depth, scribble)
 
 The barcode survives AI processing via VACE masking (mask=0 = preserve).
 The client decodes the surviving barcode on the output to know exactly which
@@ -30,7 +29,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-import cv2
 import numpy as np
 import torch
 
@@ -207,35 +205,25 @@ class LinkClock:
         return self._num_peers
 
 
-class ControlMode(str, Enum):
-    NONE = "none"
-    CANNY = "canny"
-    DEPTH = "depth"
-    SCRIBBLE = "scribble"
-
-
 class BufferMode(str, Enum):
-    STRIP = "strip"          # Just strip barcode (simplest)
-    BEAT = "beat"            # Beat-delayed: smooth full-framerate playback, N beats behind
-    LOOP = "loop"            # Loop collection: record N beats, loop playback
+    NO_BUFFER = "no_buffer"  # Just strip barcode, pass through (simplest)
     LATENCY = "latency"      # Adjustable latency: wall-clock FIFO, 0-60s delay slider
+    BEAT = "beat"            # Beat-delayed: smooth full-framerate playback, N beats behind
 
 
 # --- Config ---
 
 if _HAS_SCOPE:
     class BpmBufferConfig(BasePipelineConfig):
-        """Configuration schema for BPM Timecoded Buffer."""
+        """Configuration schema for BPM Timecoded Buffer preprocessor."""
 
         # --- Class attributes (no type annotation = plain class var, not Pydantic field) ---
-        # Scope registry accesses these on the CLASS, not instances
         pipeline_id = "bpm_timecoded_buffer"
-        pipeline_name = "BPM Timecoded Buffer (VJ.Tools)"
+        pipeline_name = "BPM Sync Timecoded Buffer (VJ.Tools)"
         pipeline_description = (
-            "Beat-grid timecoding via Ableton Link. Stamps barcode on input, "
-            "preserves through AI via VACE masking. Client decodes surviving "
-            "barcode on output for beat-accurate timing. "
-            "Canny/Depth/Scribble control modes."
+            "Beat-grid timecoding via Ableton Link. Stamps VJSync barcode on "
+            "input, preserves through AI via VACE masking (mask=0 at barcode). "
+            "Client decodes surviving barcode on output for beat-accurate timing."
         )
         supports_prompts = False
         modified = True
@@ -245,19 +233,6 @@ if _HAS_SCOPE:
             "text": ModeDefaults(default=True),
         }
 
-        # --- Load-time parameters (Pydantic fields with annotations) ---
-
-        initial_bpm: float = Field(
-            default=120.0,
-            ge=60.0,
-            le=300.0,
-            json_schema_extra=ui_field_config(
-                order=0,
-                label="Initial BPM",
-                is_load_param=True,
-            ),
-        )
-
         # --- Runtime parameters ---
 
         barcode_height: int = Field(
@@ -265,39 +240,8 @@ if _HAS_SCOPE:
             ge=4,
             le=128,
             json_schema_extra=ui_field_config(
-                order=1,
+                order=0,
                 label="Barcode Height (px)",
-                is_load_param=False,
-            ),
-        )
-
-        control_mode: ControlMode = Field(
-            default=ControlMode.NONE,
-            json_schema_extra=ui_field_config(
-                order=2,
-                label="Control Mode",
-                is_load_param=False,
-            ),
-        )
-
-        canny_low: int = Field(
-            default=50,
-            ge=0,
-            le=255,
-            json_schema_extra=ui_field_config(
-                order=3,
-                label="Canny Low Threshold",
-                is_load_param=False,
-            ),
-        )
-
-        canny_high: int = Field(
-            default=150,
-            ge=0,
-            le=255,
-            json_schema_extra=ui_field_config(
-                order=4,
-                label="Canny High Threshold",
                 is_load_param=False,
             ),
         )
@@ -307,17 +251,8 @@ if _HAS_SCOPE:
             ge=0,
             le=16,
             json_schema_extra=ui_field_config(
-                order=5,
+                order=1,
                 label="Mask Feather (px)",
-                is_load_param=False,
-            ),
-        )
-
-        strip_barcode: bool = Field(
-            default=False,
-            json_schema_extra=ui_field_config(
-                order=6,
-                label="Strip Barcode on Output",
                 is_load_param=False,
             ),
         )
@@ -325,17 +260,8 @@ if _HAS_SCOPE:
         test_input: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
-                order=7,
+                order=2,
                 label="Test Pattern Input",
-                is_load_param=False,
-            ),
-        )
-
-        tap_tempo: bool = Field(
-            default=False,
-            json_schema_extra=ui_field_config(
-                order=8,
-                label="Tap Tempo",
                 is_load_param=False,
             ),
         )
@@ -344,16 +270,10 @@ else:
         """Standalone config (no Pydantic) for testing outside Scope."""
         def __init__(self, **kwargs):
             self.pipeline_id = kwargs.get("pipeline_id", "bpm_timecoded_buffer")
-            self.pipeline_name = kwargs.get("pipeline_name", "BPM Timecoded Buffer (VJ.Tools)")
-            self.initial_bpm = kwargs.get("initial_bpm", 120.0)
+            self.pipeline_name = kwargs.get("pipeline_name", "BPM Sync Timecoded Buffer (VJ.Tools)")
             self.barcode_height = kwargs.get("barcode_height", 16)
-            self.control_mode = kwargs.get("control_mode", "none")
-            self.canny_low = kwargs.get("canny_low", 50)
-            self.canny_high = kwargs.get("canny_high", 150)
             self.mask_feather = kwargs.get("mask_feather", 2)
-            self.strip_barcode = kwargs.get("strip_barcode", False)
             self.test_input = kwargs.get("test_input", False)
-            self.tap_tempo = kwargs.get("tap_tempo", False)
 
 
 # --- Pipeline ---
@@ -363,9 +283,10 @@ class BpmTimecodedBufferPipeline(Pipeline):
     Scope preprocessor that stamps beat-grid timecodes using Ableton Link
     and creates VACE masks to preserve them through AI generation.
 
-    The barcode is stamped on input, survives through diffusion via VACE
-    masking (mask=0 at the barcode strip), and the client decodes it on
-    the output to know the exact beat position that produced each frame.
+    Automatically joins an Ableton Link session on startup. The barcode is
+    stamped on input, the VACE mask ensures AI generates everything EXCEPT
+    the barcode strip (mask=0 = preserve), and the client decodes the
+    surviving barcode on the output for beat-accurate timing.
 
     VACE mask format (matching Scope's VaceEncodingBlock):
       - vace_input_frames [1,3,F,H,W] [-1,1]: full frames with barcode
@@ -394,35 +315,21 @@ class BpmTimecodedBufferPipeline(Pipeline):
         self.dtype = dtype if self.device.type == "cuda" else torch.float32
         self._frame_seq = 0
 
-        initial_bpm = getattr(config, "initial_bpm", 120.0)
-        self._clock = LinkClock(initial_bpm)
-        self._clock.start(initial_bpm)
+        # Always start Ableton Link — BPM comes from the Link session
+        self._clock = LinkClock(120.0)
+        self._clock.start(120.0)
 
         # Test pattern source (lazy-initialized on first use)
         self._test_source: Optional[TestPatternSource] = None
 
         logger.info(
             f"[BPM Buffer] Pipeline initialized "
-            f"(device={self.device}, bpm={initial_bpm})"
+            f"(device={self.device}, Link started at 120 BPM)"
         )
 
     def __del__(self):
         if hasattr(self, "_clock"):
             self._clock.stop()
-
-    def tap_bpm(self) -> Optional[float]:
-        """
-        Tap tempo — call repeatedly to tap in a BPM.
-        Useful on RunPod or anywhere without Ableton Link.
-        Returns detected BPM after 2+ taps, or None after first tap.
-        """
-        if self._test_source is None:
-            self._test_source = TestPatternSource()
-        detected = self._test_source.tap()
-        if detected is not None:
-            self._clock._tempo = detected
-            logger.info(f"[BPM Buffer] Tap tempo: {detected:.1f} BPM")
-        return detected
 
     def set_bpm(self, bpm: float):
         """Manually set BPM (for RunPod / no-Link scenarios)."""
@@ -447,17 +354,8 @@ class BpmTimecodedBufferPipeline(Pipeline):
         """
         video = kwargs.get("video", [])
         barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
-        control_mode = str(kwargs.get("control_mode", getattr(self.config, "control_mode", "none")))
-        canny_low = kwargs.get("canny_low", getattr(self.config, "canny_low", 50))
-        canny_high = kwargs.get("canny_high", getattr(self.config, "canny_high", 150))
         mask_feather = kwargs.get("mask_feather", getattr(self.config, "mask_feather", 2))
-        strip_barcode = kwargs.get("strip_barcode", getattr(self.config, "strip_barcode", False))
         test_input = kwargs.get("test_input", getattr(self.config, "test_input", False))
-        tap_tempo = kwargs.get("tap_tempo", getattr(self.config, "tap_tempo", False))
-
-        # --- Tap tempo (boolean toggle triggers a tap) ---
-        if tap_tempo:
-            self.tap_bpm()
 
         # Handle both list and tensor input, or empty
         if isinstance(video, list) and len(video) == 0:
@@ -504,7 +402,8 @@ class BpmTimecodedBufferPipeline(Pipeline):
         frames_stamped = torch.from_numpy(frames_np).float()
 
         # --- 2. Generate VACE mask ---
-        # mask=1 -> inpaint (AI generates), mask=0 -> preserve (barcode survives)
+        # mask=1 -> inpaint (AI generates everything above barcode)
+        # mask=0 -> preserve (barcode strip survives AI untouched)
         mask = torch.ones(F, H, W, dtype=torch.float32)
         mask[:, -barcode_h:, :] = 0.0  # Preserve barcode strip
 
@@ -525,44 +424,19 @@ class BpmTimecodedBufferPipeline(Pipeline):
         vace_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, F, H, W)
         vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
 
-        # --- 4. Optional ControlNet preprocessing ---
-        control_video = None
-        if control_mode != "none":
-            control_video = self._apply_control(
-                frames_stamped, barcode_h, control_mode, canny_low, canny_high
-            )
-
-        # --- 5. Display output ---
-        # Scope pipeline_processor does: if dtype != uint8: value = (value * 255).clamp(0,255).uint8
-        # So we return [0, 1] float and let Scope handle the conversion.
-        frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
+        # --- 4. Display output ---
+        # Show barcode with subtle green tint so you can verify it's there
         display = frames_01.clone()
-        if strip_barcode:
-            display[:, -barcode_h:, :, :] = 0.0
-        else:
-            # Show barcode with subtle green tint so you can verify it survives
-            mask_cpu = mask.unsqueeze(-1)  # (F, H, W, 1)
-            preserve = 1.0 - mask_cpu
-            display = (display + preserve * torch.tensor([0.0, 0.05, 0.0])).clamp(0.0, 1.0)
-
-        logger.info(
-            f"[BPM Buffer] Output: shape={display.shape}, dtype={display.dtype}, "
-            f"min={display.min():.3f}, max={display.max():.3f}, device={display.device}"
-        )
+        mask_cpu = mask.unsqueeze(-1)  # (F, H, W, 1)
+        preserve = 1.0 - mask_cpu
+        display = (display + preserve * torch.tensor([0.0, 0.05, 0.0])).clamp(0.0, 1.0)
 
         result = {"video": display}
 
-        # Only forward VACE tensors when the downstream pipeline supports VACE.
-        # Scope sets vace_enabled=True in kwargs when the frontend has VACE mode on.
-        # If we always forward these, they poison the downstream call_params and
-        # prevent video from being assigned (pipeline_processor skips video assignment
-        # when vace_input_frames is already in call_params).
-        if kwargs.get("vace_enabled", False):
-            result["vace_input_frames"] = vace_frames
-            result["vace_input_masks"] = vace_mask
-
-        if control_video is not None:
-            result["control_video"] = control_video
+        # Always forward VACE tensors — the barcode MUST be preserved through AI.
+        # The mask ensures AI generates everything except the barcode strip.
+        result["vace_input_frames"] = vace_frames
+        result["vace_input_masks"] = vace_mask
 
         # Link state for diagnostics
         result["_bpm_buffer_meta"] = {
@@ -574,53 +448,6 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
         return result
 
-    def _apply_control(
-        self,
-        frames: torch.Tensor,
-        barcode_h: int,
-        mode: str,
-        canny_low: int,
-        canny_high: int,
-    ) -> torch.Tensor:
-        """Apply ControlNet preprocessing to content region (above barcode)."""
-        F, H, W, C = frames.shape
-        content_h = H - barcode_h
-
-        frames_np = frames.cpu().numpy().astype(np.uint8)
-        control_np = np.zeros_like(frames_np, dtype=np.uint8)
-
-        for f_idx in range(F):
-            content = frames_np[f_idx, :content_h, :, :]
-
-            if mode == "canny":
-                gray = cv2.cvtColor(content, cv2.COLOR_RGB2GRAY)
-                edges = cv2.Canny(gray, canny_low, canny_high)
-                control_np[f_idx, :content_h, :, :] = np.stack([edges] * 3, axis=-1)
-
-            elif mode == "depth":
-                gray = cv2.cvtColor(content, cv2.COLOR_RGB2GRAY)
-                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                lap = np.abs(cv2.Laplacian(blurred, cv2.CV_64F))
-                depth = (lap / (lap.max() + 1e-8) * 255).astype(np.uint8)
-                depth_color = cv2.applyColorMap(depth, cv2.COLORMAP_INFERNO)
-                control_np[f_idx, :content_h, :, :] = cv2.cvtColor(
-                    depth_color, cv2.COLOR_BGR2RGB
-                )
-
-            elif mode == "scribble":
-                gray = cv2.cvtColor(content, cv2.COLOR_RGB2GRAY)
-                blur = cv2.GaussianBlur(gray, (3, 3), 0)
-                edges = cv2.adaptiveThreshold(
-                    blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY_INV, 11, 2
-                )
-                kernel = np.ones((2, 2), np.uint8)
-                edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-                control_np[f_idx, :content_h, :, :] = np.stack([edges] * 3, axis=-1)
-
-        control = torch.from_numpy(control_np).float() / 255.0
-        return control.to(device=self.device)
-
 
 # --- Postprocessor Config ---
 
@@ -630,10 +457,10 @@ if _HAS_SCOPE:
 
         # Class attributes (no annotation = not a Pydantic field)
         pipeline_id = "bpm_timecode_strip"
-        pipeline_name = "BPM Timecode Buffer Output (VJ.Tools)"
+        pipeline_name = "BPM Sync Timecoded Buffer Output (VJ.Tools)"
         pipeline_description = (
             "Postprocessor that decodes timecode barcodes from AI output and "
-            "provides beat-quantized, loop, or latency-compensated buffering. "
+            "provides latency-compensated or beat-quantized buffering. "
             "Strips the barcode from output so viewers don't see it."
         )
         supports_prompts = False
@@ -645,33 +472,12 @@ if _HAS_SCOPE:
         }
 
         # Pydantic fields
-        barcode_height: int = Field(
-            default=16,
-            ge=4,
-            le=128,
-            json_schema_extra=ui_field_config(
-                order=0,
-                label="Barcode Height (px)",
-                is_load_param=False,
-            ),
-        )
 
         buffer_mode: BufferMode = Field(
-            default=BufferMode.STRIP,
+            default=BufferMode.LATENCY,
             json_schema_extra=ui_field_config(
-                order=1,
+                order=0,
                 label="Buffer Mode",
-                is_load_param=False,
-            ),
-        )
-
-        loop_length_beats: int = Field(
-            default=8,
-            ge=1,
-            le=64,
-            json_schema_extra=ui_field_config(
-                order=2,
-                label="Loop Length (beats)",
                 is_load_param=False,
             ),
         )
@@ -681,9 +487,11 @@ if _HAS_SCOPE:
             ge=0,
             le=60000,
             json_schema_extra=ui_field_config(
-                order=3,
+                order=1,
                 label="Latency Buffer (ms)",
                 is_load_param=False,
+                midi_assignable=True,
+                midi_type="fader",
             ),
         )
 
@@ -692,9 +500,31 @@ if _HAS_SCOPE:
             ge=1,
             le=64,
             json_schema_extra=ui_field_config(
-                order=4,
+                order=2,
                 label="Beat Buffer Depth",
                 is_load_param=False,
+            ),
+        )
+
+        hold: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=3,
+                label="HOLD (freeze playback)",
+                is_load_param=False,
+                midi_assignable=True,
+                midi_type="button",
+            ),
+        )
+
+        reset_buffer: bool = Field(
+            default=False,
+            json_schema_extra=ui_field_config(
+                order=4,
+                label="Reset Buffer",
+                is_load_param=False,
+                midi_assignable=True,
+                midi_type="button",
             ),
         )
 
@@ -718,21 +548,26 @@ if _HAS_SCOPE:
             ),
         )
 
-        hold: bool = Field(
-            default=False,
+        barcode_height: int = Field(
+            default=16,
+            ge=4,
+            le=128,
             json_schema_extra=ui_field_config(
                 order=7,
-                label="HOLD (freeze playback)",
+                label="Barcode Height (px)",
                 is_load_param=False,
             ),
         )
 
-        loop_reset: bool = Field(
-            default=False,
+        buffer_fill_pct: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=100.0,
             json_schema_extra=ui_field_config(
                 order=8,
-                label="Reset Loop",
+                label="Buffer Fill %",
                 is_load_param=False,
+                read_only=True,
             ),
         )
 else:
@@ -740,16 +575,16 @@ else:
         """Standalone config for testing outside Scope."""
         def __init__(self, **kwargs):
             self.pipeline_id = kwargs.get("pipeline_id", "bpm_timecode_strip")
-            self.pipeline_name = kwargs.get("pipeline_name", "BPM Timecode Buffer Output (VJ.Tools)")
-            self.barcode_height = kwargs.get("barcode_height", 16)
-            self.buffer_mode = kwargs.get("buffer_mode", "strip")
-            self.loop_length_beats = kwargs.get("loop_length_beats", 8)
+            self.pipeline_name = kwargs.get("pipeline_name", "BPM Sync Timecoded Buffer Output (VJ.Tools)")
+            self.buffer_mode = kwargs.get("buffer_mode", "latency")
             self.latency_delay_ms = kwargs.get("latency_delay_ms", 100)
             self.beat_buffer_depth = kwargs.get("beat_buffer_depth", 4)
+            self.hold = kwargs.get("hold", False)
+            self.reset_buffer = kwargs.get("reset_buffer", False)
             self.link_sync = kwargs.get("link_sync", False)
             self.link_bpm = kwargs.get("link_bpm", 120.0)
-            self.hold = kwargs.get("hold", False)
-            self.loop_reset = kwargs.get("loop_reset", False)
+            self.barcode_height = kwargs.get("barcode_height", 16)
+            self.buffer_fill_pct = kwargs.get("buffer_fill_pct", 0.0)
 
 
 # --- Buffered Frame ---
@@ -778,14 +613,12 @@ class BpmTimecodeStripPipeline(Pipeline):
     at any delay depth — no stepped/stutter beat-locked behavior.
 
     Buffer modes:
-      - strip:   Just strip the barcode (pass-through, simplest)
-      - beat:    Beat-delayed — delay = beat_buffer_depth × ms_per_beat.
-                 Plays back every frame smoothly, delayed by N beats.
-      - loop:    Loop collection — record N beats of frames, loop playback
-      - latency: Adjustable latency — same FIFO + binary search with
-                 configurable delay in ms (0-60000). Sliding the delay
-                 shorter speeds up playback (catch up), sliding longer
-                 slows down (buffer fills). Smooth and expressive.
+      - no_buffer: Just strip the barcode (pass-through, simplest)
+      - latency:   Adjustable latency (default) — FIFO + binary search with
+                   configurable delay in ms (0-60000). MIDI fader assignable.
+                   Sliding shorter → catch up, sliding longer → buffer fills.
+      - beat:      Beat-delayed — delay = beat_buffer_depth × ms_per_beat.
+                   Plays back every frame smoothly, delayed by N beats.
     """
 
     # 60 seconds at ~30fps = 1800 frames max
@@ -838,12 +671,6 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # Extra delay accumulated during hold (added to beat delay on release)
         self._playback_extra_delay: float = 0.0
-
-        # Loop buffer
-        self._loop_frames: list[_BufferedFrame] = []
-        self._loop_recording: bool = True
-        self._loop_start_beat: Optional[int] = None
-        self._loop_playhead: int = 0
 
         # Stats
         self._decode_success = 0
@@ -945,11 +772,10 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # Read params from kwargs first (Scope runtime updates), fall back to config
         barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
-        mode = str(kwargs.get("buffer_mode", getattr(self.config, "buffer_mode", "strip")))
-        loop_len = kwargs.get("loop_length_beats", getattr(self.config, "loop_length_beats", 8))
+        mode = str(kwargs.get("buffer_mode", getattr(self.config, "buffer_mode", "latency")))
         latency_ms = kwargs.get("latency_delay_ms", getattr(self.config, "latency_delay_ms", 100))
         beat_depth = kwargs.get("beat_buffer_depth", getattr(self.config, "beat_buffer_depth", 4))
-        loop_reset = kwargs.get("loop_reset", getattr(self.config, "loop_reset", False))
+        reset_buffer = kwargs.get("reset_buffer", getattr(self.config, "reset_buffer", False))
         link_sync = kwargs.get("link_sync", getattr(self.config, "link_sync", False))
         hold = kwargs.get("hold", getattr(self.config, "hold", False))
 
@@ -960,13 +786,14 @@ class BpmTimecodeStripPipeline(Pipeline):
         elif not link_sync and self._link_active:
             self._stop_link()
 
-        # --- Loop reset trigger ---
-        if loop_reset:
-            self._loop_frames.clear()
-            self._loop_recording = True
-            self._loop_start_beat = None
-            self._loop_playhead = 0
-            logger.info("[BPM Buffer Output] Loop reset")
+        # --- Reset buffer trigger (MIDI button assignable) ---
+        if reset_buffer:
+            self._beat_fifo.clear()
+            self._latency_fifo.clear()
+            self._current_output = None
+            self._playback_extra_delay = 0.0
+            self._hold_active = False
+            logger.info("[BPM Buffer Output] Buffer reset")
 
         # --- Hold toggle ---
         if hold and not self._hold_active:
@@ -1037,19 +864,12 @@ class BpmTimecodeStripPipeline(Pipeline):
             ))
 
         # --- Apply buffer mode ---
-        if mode == "beat":
-            output_frame = self._process_beat(incoming, beat_depth)
-        elif mode == "loop":
-            output_frames = self._process_loop(incoming, loop_len)
-            # Loop returns a list, wrap for consistency
-            if output_frames:
-                output_frame = output_frames[-1]
-            else:
-                output_frame = incoming[-1].frame if incoming else np.zeros((H, W, C), dtype=np.uint8)
-        elif mode == "latency":
+        if mode == "latency":
             output_frame = self._process_latency(incoming, latency_ms)
+        elif mode == "beat":
+            output_frame = self._process_beat(incoming, beat_depth)
         else:
-            # strip mode: pass through with barcode stripped
+            # no_buffer mode: pass through with barcode stripped
             output_frame = incoming[-1].frame if incoming else np.zeros((H, W, C), dtype=np.uint8)
 
         # Log every 100 frames for diagnostics
@@ -1069,6 +889,20 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         result = {"video": out_tensor}
 
+        # --- Buffer fill percentage (output to UI slider) ---
+        # Calculate how full the active buffer is relative to MAX_FIFO_FRAMES
+        if mode == "latency":
+            active_fifo_size = len(self._latency_fifo)
+        elif mode == "beat":
+            active_fifo_size = len(self._beat_fifo)
+        else:
+            active_fifo_size = 0
+        buffer_fill_pct = min(100.0, (active_fifo_size / self.MAX_FIFO_FRAMES) * 100.0)
+
+        # Write back to config so Scope can display it on the read-only slider
+        if hasattr(self.config, "buffer_fill_pct"):
+            self.config.buffer_fill_pct = buffer_fill_pct
+
         # Diagnostics metadata
         total = self._decode_success + self._decode_fail
         rate = self._decode_success / total if total > 0 else 0.0
@@ -1078,6 +912,7 @@ class BpmTimecodeStripPipeline(Pipeline):
             "decode_success": self._decode_success,
             "decode_fail": self._decode_fail,
             "buffer_mode": mode,
+            "buffer_fill_pct": buffer_fill_pct,
             "beat_fifo_size": len(self._beat_fifo),
             "latency_fifo_size": len(self._latency_fifo),
             "hold_active": self._hold_active,
@@ -1139,52 +974,6 @@ class BpmTimecodeStripPipeline(Pipeline):
             self._current_output = frame
 
         return self._current_output if self._current_output is not None else incoming[-1].frame
-
-    def _process_loop(
-        self, incoming: list[_BufferedFrame], loop_length_beats: int
-    ) -> list[np.ndarray]:
-        """
-        Loop mode: record frames for N beats, then loop playback.
-        Uses Ableton Link beat when available for accurate loop boundaries.
-        """
-        if self._loop_recording:
-            # Recording phase
-            for bf in incoming:
-                # Use Link beat for loop timing if available
-                current_beat = bf.beat
-                if self._link_active and self._clock is not None:
-                    current_beat = self._clock.beat
-
-                if self._loop_start_beat is None:
-                    self._loop_start_beat = int(current_beat)
-
-                beats_elapsed = current_beat - self._loop_start_beat
-                if beats_elapsed < loop_length_beats:
-                    self._loop_frames.append(bf)
-                else:
-                    # Done recording
-                    self._loop_recording = False
-                    logger.info(
-                        f"[BPM Buffer Output] Loop recorded: {len(self._loop_frames)} "
-                        f"frames over {loop_length_beats} beats"
-                    )
-                    break
-
-            if self._loop_recording:
-                # Still recording — pass through
-                return [bf.frame for bf in incoming]
-
-        # Playback phase — cycle through recorded frames
-        if not self._loop_frames:
-            return [bf.frame for bf in incoming]
-
-        output = []
-        for _ in incoming:
-            idx = self._loop_playhead % len(self._loop_frames)
-            output.append(self._loop_frames[idx].frame)
-            self._loop_playhead += 1
-
-        return output
 
     def _process_latency(
         self, incoming: list[_BufferedFrame], delay_ms: int
