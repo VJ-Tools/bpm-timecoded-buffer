@@ -489,9 +489,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=1,
                 label="Latency Buffer (ms)",
-                is_load_param=False,
-                midi_assignable=True,
-                midi_type="fader",
+                category="input",
             ),
         )
 
@@ -502,7 +500,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=2,
                 label="Beat Buffer Depth",
-                is_load_param=False,
+                category="input",
             ),
         )
 
@@ -511,9 +509,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=3,
                 label="HOLD (freeze playback)",
-                is_load_param=False,
-                midi_assignable=True,
-                midi_type="button",
+                category="input",
             ),
         )
 
@@ -522,9 +518,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=4,
                 label="Reset Buffer",
-                is_load_param=False,
-                midi_assignable=True,
-                midi_type="button",
+                category="input",
             ),
         )
 
@@ -533,7 +527,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=5,
                 label="Ableton Link Sync",
-                is_load_param=False,
             ),
         )
 
@@ -543,8 +536,7 @@ if _HAS_SCOPE:
             le=999.0,
             json_schema_extra=ui_field_config(
                 order=6,
-                label="Link BPM (read-only when synced)",
-                is_load_param=False,
+                label="Link BPM",
             ),
         )
 
@@ -555,7 +547,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=7,
                 label="Barcode Height (px)",
-                is_load_param=False,
+                is_load_param=True,
             ),
         )
 
@@ -566,8 +558,6 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=8,
                 label="Buffer Fill %",
-                is_load_param=False,
-                read_only=True,
             ),
         )
 else:
