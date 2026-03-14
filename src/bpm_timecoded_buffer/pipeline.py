@@ -216,9 +216,9 @@ class ControlMode(str, Enum):
 
 class BufferMode(str, Enum):
     STRIP = "strip"          # Just strip barcode (simplest)
-    BEAT = "beat"            # Beat-quantized: release frames on beat boundaries
+    BEAT = "beat"            # Beat-delayed: smooth full-framerate playback, N beats behind
     LOOP = "loop"            # Loop collection: record N beats, loop playback
-    LATENCY = "latency"      # Adjustable latency: FIFO buffer to smooth jitter
+    LATENCY = "latency"      # Adjustable latency: wall-clock FIFO, 0-60s delay slider
 
 
 # --- Config ---
@@ -679,7 +679,7 @@ if _HAS_SCOPE:
         latency_delay_ms: int = Field(
             default=100,
             ge=0,
-            le=2000,
+            le=60000,
             json_schema_extra=ui_field_config(
                 order=3,
                 label="Latency Buffer (ms)",
@@ -687,13 +687,13 @@ if _HAS_SCOPE:
             ),
         )
 
-        beat_hold_beats: int = Field(
-            default=2,
+        beat_buffer_depth: int = Field(
+            default=4,
             ge=1,
             le=64,
             json_schema_extra=ui_field_config(
                 order=4,
-                label="Beat Hold Window",
+                label="Beat Buffer Depth",
                 is_load_param=False,
             ),
         )
@@ -727,53 +727,11 @@ if _HAS_SCOPE:
             ),
         )
 
-        min_buffer_beats: int = Field(
-            default=8,
-            ge=1,
-            le=32,
-            json_schema_extra=ui_field_config(
-                order=8,
-                label="Min Buffer (beats)",
-                is_load_param=False,
-            ),
-        )
-
-        auto_loop_beats: int = Field(
-            default=4,
-            ge=2,
-            le=8,
-            json_schema_extra=ui_field_config(
-                order=9,
-                label="Auto-Loop Length (beats)",
-                is_load_param=False,
-            ),
-        )
-
-        jump_ahead: bool = Field(
-            default=False,
-            json_schema_extra=ui_field_config(
-                order=10,
-                label="Jump Ahead (trim to min buffer)",
-                is_load_param=False,
-            ),
-        )
-
         loop_reset: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
-                order=11,
+                order=8,
                 label="Reset Loop",
-                is_load_param=False,
-            ),
-        )
-
-        latency_nudge_ms: int = Field(
-            default=10,
-            ge=1,
-            le=100,
-            json_schema_extra=ui_field_config(
-                order=12,
-                label="Latency Nudge Step (ms)",
                 is_load_param=False,
             ),
         )
@@ -787,15 +745,11 @@ else:
             self.buffer_mode = kwargs.get("buffer_mode", "strip")
             self.loop_length_beats = kwargs.get("loop_length_beats", 8)
             self.latency_delay_ms = kwargs.get("latency_delay_ms", 100)
-            self.beat_hold_beats = kwargs.get("beat_hold_beats", 2)
+            self.beat_buffer_depth = kwargs.get("beat_buffer_depth", 4)
             self.link_sync = kwargs.get("link_sync", False)
             self.link_bpm = kwargs.get("link_bpm", 120.0)
             self.hold = kwargs.get("hold", False)
-            self.min_buffer_beats = kwargs.get("min_buffer_beats", 8)
-            self.auto_loop_beats = kwargs.get("auto_loop_beats", 4)
-            self.jump_ahead = kwargs.get("jump_ahead", False)
             self.loop_reset = kwargs.get("loop_reset", False)
-            self.latency_nudge_ms = kwargs.get("latency_nudge_ms", 10)
 
 
 # --- Buffered Frame ---
@@ -815,18 +769,29 @@ class _BufferedFrame:
 class BpmTimecodeStripPipeline(Pipeline):
     """
     Scope postprocessor that decodes timecode barcodes from AI output,
-    strips the barcode, and optionally buffers frames for beat-accurate
-    playback.
+    strips the barcode, and buffers frames for smooth full-framerate playback.
+
+    Architecture: Wall-clock FIFO + binary search.
+    ALL frames are stored with their wall-clock timestamp (time.monotonic()).
+    On each render call, we compute a target_time in the past and binary-search
+    the FIFO for the closest frame. This gives smooth full-framerate playback
+    at any delay depth — no stepped/stutter beat-locked behavior.
 
     Buffer modes:
       - strip:   Just strip the barcode (pass-through, simplest)
-      - beat:    Beat-quantized — hold frames until the next beat boundary,
-                 then release the frame closest to that beat
-      - loop:    Loop collection — record N beats of frames into a loop,
-                 then cycle playback beat-synced
-      - latency: Adjustable latency — FIFO buffer with configurable delay
-                 to smooth out variable inference jitter
+      - beat:    Beat-delayed — delay = beat_buffer_depth × ms_per_beat.
+                 Plays back every frame smoothly, delayed by N beats.
+      - loop:    Loop collection — record N beats of frames, loop playback
+      - latency: Adjustable latency — same FIFO + binary search with
+                 configurable delay in ms (0-60000). Sliding the delay
+                 shorter speeds up playback (catch up), sliding longer
+                 slows down (buffer fills). Smooth and expressive.
     """
+
+    # 60 seconds at ~30fps = 1800 frames max
+    MAX_FIFO_FRAMES = 1800
+    # Synthetic fallback BPM when no clock source available
+    SYNTHETIC_BPM = 120.0
 
     @classmethod
     def get_config_class(cls):
@@ -858,23 +823,21 @@ class BpmTimecodeStripPipeline(Pipeline):
             link_bpm = getattr(config, "link_bpm", 120.0)
             self._start_link(link_bpm)
 
-        # Beat-quantized buffer
-        self._beat_buffer: list[_BufferedFrame] = []
-        self._last_released_beat: int = -1
-        self._last_released_frame: Optional[np.ndarray] = None
-        self._latest_decoded_beat: float = -1.0
-        self._prev_decoded_beat: float = -1.0
+        # --- Wall-clock FIFO buffers ---
+        # Beat mode and latency mode share the same architecture:
+        # append all frames with timestamp, binary search for target time
+        self._beat_fifo: list[_BufferedFrame] = []
+        self._latency_fifo: list[_BufferedFrame] = []
 
-        # Hold state (CDJ-style freeze)
+        # Current output frame (held between calls when FIFO is empty)
+        self._current_output: Optional[np.ndarray] = None
+
+        # Hold state — freezes target_time at the moment hold was engaged
         self._hold_active: bool = False
-        self._hold_playhead_beat: int = -1
-        self._playback_cursor: int = -1  # -1 = normal, >= 0 = offset playback
+        self._hold_target_time: float = 0.0  # frozen wall-clock target
 
-        # Auto-loop on catchup
-        self._auto_loop_active: bool = False
-        self._auto_loop_start: int = -1
-        self._auto_loop_end: int = -1
-        self._auto_loop_cursor: int = -1
+        # Extra delay accumulated during hold (added to beat delay on release)
+        self._playback_extra_delay: float = 0.0
 
         # Loop buffer
         self._loop_frames: list[_BufferedFrame] = []
@@ -882,14 +845,11 @@ class BpmTimecodeStripPipeline(Pipeline):
         self._loop_start_beat: Optional[int] = None
         self._loop_playhead: int = 0
 
-        # Latency FIFO
-        self._latency_fifo: list[_BufferedFrame] = []
-
         # Stats
         self._decode_success = 0
         self._decode_fail = 0
 
-        logger.info("[BPM Buffer Output] Postprocessor initialized")
+        logger.info("[BPM Buffer Output] Postprocessor initialized (wall-clock FIFO)")
 
     def _start_link(self, bpm: float = 120.0):
         """Start Ableton Link clock for local beat sync."""
@@ -912,6 +872,61 @@ class BpmTimecodeStripPipeline(Pipeline):
         if hasattr(self, "_clock") and self._clock is not None:
             self._clock.stop()
 
+    def _get_effective_bpm(self) -> float:
+        """Get BPM from Link clock → latest frame barcode → synthetic fallback."""
+        if self._link_active and self._clock is not None:
+            bpm = self._clock.tempo
+            if bpm and bpm > 0:
+                return bpm
+        # Try from latest frame in beat FIFO
+        if self._beat_fifo:
+            latest_bpm = self._beat_fifo[-1].bpm
+            if latest_bpm > 0:
+                return latest_bpm
+        return self.SYNTHETIC_BPM
+
+    @staticmethod
+    def _binary_search_closest(
+        fifo: list[_BufferedFrame], target_time: float
+    ) -> Optional[np.ndarray]:
+        """
+        Binary search the FIFO for the frame closest to target_time.
+        Returns the frame's numpy array, or None if FIFO is empty.
+        """
+        if not fifo:
+            return None
+
+        lo, hi = 0, len(fifo) - 1
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if fifo[mid].timestamp < target_time:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        # lo is now the first frame >= target_time
+        # Check if the previous frame is actually closer
+        best = fifo[lo]
+        if lo > 0:
+            prev = fifo[lo - 1]
+            if abs(prev.timestamp - target_time) < abs(best.timestamp - target_time):
+                best = prev
+
+        return best.frame
+
+    @staticmethod
+    def _evict_old_frames(
+        fifo: list[_BufferedFrame], target_time: float, keep_margin: float = 2.0
+    ):
+        """
+        Evict frames older than target_time - keep_margin seconds.
+        Done BEFORE binary search to prevent returning stale frames.
+        Always keeps at least 1 frame.
+        """
+        cutoff = target_time - keep_margin
+        while len(fifo) > 1 and fifo[0].timestamp < cutoff:
+            fifo.pop(0)
+
     def prepare(self, **kwargs) -> "Requirements":
         """Tell Scope how many input frames we need per call."""
         return Requirements(input_size=1)
@@ -933,13 +948,10 @@ class BpmTimecodeStripPipeline(Pipeline):
         mode = str(kwargs.get("buffer_mode", getattr(self.config, "buffer_mode", "strip")))
         loop_len = kwargs.get("loop_length_beats", getattr(self.config, "loop_length_beats", 8))
         latency_ms = kwargs.get("latency_delay_ms", getattr(self.config, "latency_delay_ms", 100))
-        beat_hold = kwargs.get("beat_hold_beats", getattr(self.config, "beat_hold_beats", 2))
+        beat_depth = kwargs.get("beat_buffer_depth", getattr(self.config, "beat_buffer_depth", 4))
         loop_reset = kwargs.get("loop_reset", getattr(self.config, "loop_reset", False))
         link_sync = kwargs.get("link_sync", getattr(self.config, "link_sync", False))
         hold = kwargs.get("hold", getattr(self.config, "hold", False))
-        min_buffer = kwargs.get("min_buffer_beats", getattr(self.config, "min_buffer_beats", 8))
-        auto_loop_beats = kwargs.get("auto_loop_beats", getattr(self.config, "auto_loop_beats", 4))
-        jump_ahead = kwargs.get("jump_ahead", getattr(self.config, "jump_ahead", False))
 
         # --- Ableton Link toggle ---
         if link_sync and not self._link_active:
@@ -956,45 +968,28 @@ class BpmTimecodeStripPipeline(Pipeline):
             self._loop_playhead = 0
             logger.info("[BPM Buffer Output] Loop reset")
 
-        # --- Hold toggle (CDJ-style) ---
+        # --- Hold toggle ---
         if hold and not self._hold_active:
-            # Engage hold — freeze at current playback position
+            # Engage hold — freeze target_time at current playback position
             self._hold_active = True
-            if self._playback_cursor >= 0:
-                self._hold_playhead_beat = self._playback_cursor
-            elif self._latest_decoded_beat >= 0:
-                self._hold_playhead_beat = int(self._latest_decoded_beat) - beat_hold
-            else:
-                self._hold_playhead_beat = self._last_released_beat
-            logger.info(f"[BPM Buffer Output] HOLD engaged at beat {self._hold_playhead_beat}")
+            bpm = self._get_effective_bpm()
+            ms_per_beat = 60_000.0 / bpm
+            delay_s = (beat_depth * ms_per_beat + self._playback_extra_delay) / 1000.0
+            self._hold_target_time = time.monotonic() - delay_s
+            logger.info(f"[BPM Buffer Output] HOLD engaged at target_time={self._hold_target_time:.3f}")
         elif not hold and self._hold_active:
-            # Release hold — resume from held position
+            # Release hold — the time that passed during hold becomes extra delay
+            bpm = self._get_effective_bpm()
+            ms_per_beat = 60_000.0 / bpm
+            nominal_delay_s = (beat_depth * ms_per_beat) / 1000.0
+            actual_delay_s = time.monotonic() - self._hold_target_time
+            self._playback_extra_delay = (actual_delay_s - nominal_delay_s) * 1000.0
+            if self._playback_extra_delay < 0:
+                self._playback_extra_delay = 0.0
             self._hold_active = False
-            self._playback_cursor = self._hold_playhead_beat
-            self._hold_playhead_beat = -1
-            self._auto_loop_active = False
-            logger.info(f"[BPM Buffer Output] HOLD released, cursor at {self._playback_cursor}")
-
-        # --- Jump Ahead trigger ---
-        if jump_ahead and self._latest_decoded_beat >= 0:
-            effective_min = max(min_buffer, beat_hold)
-            latest_whole = int(self._latest_decoded_beat)
-            normal_target = latest_whole - beat_hold
-            current_playback = self._playback_cursor if self._playback_cursor >= 0 else normal_target
-            gap = normal_target - current_playback
-            if gap > 0:
-                new_target = latest_whole - effective_min
-                self._playback_cursor = new_target
-                self._auto_loop_active = False
-                # Prune frames we jumped past
-                self._beat_buffer = [
-                    bf for bf in self._beat_buffer
-                    if bf.beat >= new_target - 2
-                ]
-                logger.info(
-                    f"[BPM Buffer Output] JUMP AHEAD: skipped {gap - effective_min} beats, "
-                    f"cursor now at {new_target}"
-                )
+            logger.info(
+                f"[BPM Buffer Output] HOLD released, extra_delay={self._playback_extra_delay:.0f}ms"
+            )
 
         # Stack frames — handle both list of tensors and single tensor
         if isinstance(video, list):
@@ -1020,94 +1015,74 @@ class BpmTimecodeStripPipeline(Pipeline):
                 self._decode_success += 1
                 beat = payload.beat_whole + decode_beat_frac(payload.beat_frac)
                 bpm = decode_bpm(payload.bpm_encoded)
-
-                # Strip barcode
-                frame_np[-barcode_h:, :, :] = 0
-
-                incoming.append(_BufferedFrame(
-                    frame=frame_np,
-                    beat=beat,
-                    bpm=bpm,
-                    frame_seq=payload.frame_seq,
-                    timestamp=now,
-                ))
             else:
                 self._decode_fail += 1
-                # Still strip barcode even if decode fails
-                frame_np[-barcode_h:, :, :] = 0
-
-                # Use Link beat if available, otherwise fallback
+                # Use Link beat if available, otherwise synthetic
                 if self._link_active and self._clock is not None:
-                    fallback_beat = self._clock.beat
-                    fallback_bpm = self._clock.tempo
+                    beat = self._clock.beat
+                    bpm = self._clock.tempo
                 else:
-                    fallback_beat = 0.0
-                    fallback_bpm = 120.0
+                    beat = 0.0
+                    bpm = self.SYNTHETIC_BPM
 
-                incoming.append(_BufferedFrame(
-                    frame=frame_np,
-                    beat=fallback_beat,
-                    bpm=fallback_bpm,
-                    frame_seq=0,
-                    timestamp=now,
-                ))
+            # Strip barcode from output
+            frame_np[-barcode_h:, :, :] = 0
+
+            incoming.append(_BufferedFrame(
+                frame=frame_np,
+                beat=beat,
+                bpm=bpm,
+                frame_seq=payload.frame_seq if payload else 0,
+                timestamp=now,
+            ))
 
         # --- Apply buffer mode ---
         if mode == "beat":
-            output_frames = self._process_beat_quantized(
-                incoming, beat_hold, auto_loop_beats
-            )
+            output_frame = self._process_beat(incoming, beat_depth)
         elif mode == "loop":
             output_frames = self._process_loop(incoming, loop_len)
+            # Loop returns a list, wrap for consistency
+            if output_frames:
+                output_frame = output_frames[-1]
+            else:
+                output_frame = incoming[-1].frame if incoming else np.zeros((H, W, C), dtype=np.uint8)
         elif mode == "latency":
-            output_frames = self._process_latency(incoming, latency_ms)
+            output_frame = self._process_latency(incoming, latency_ms)
         else:
             # strip mode: pass through with barcode stripped
-            output_frames = [bf.frame for bf in incoming]
+            output_frame = incoming[-1].frame if incoming else np.zeros((H, W, C), dtype=np.uint8)
 
         # Log every 100 frames for diagnostics
         total = self._decode_success + self._decode_fail
         if total % 100 == 1:
-            # Calculate buffer fill
-            if self._latest_decoded_beat >= 0:
-                current_pb = self._playback_cursor if self._playback_cursor >= 0 else int(self._latest_decoded_beat) - beat_hold
-                fill = int(self._latest_decoded_beat) - current_pb
-            else:
-                fill = 0
+            beat_fill = len(self._beat_fifo)
+            lat_fill = len(self._latency_fifo)
             logger.info(
                 f"[BPM Buffer Output] mode={mode}, decode={self._decode_success}/{total}, "
                 f"link={self._link_active}, hold={self._hold_active}, "
-                f"fill={fill}b, autoloop={self._auto_loop_active}, "
-                f"incoming={len(incoming)}, output={len(output_frames)}"
+                f"beat_fifo={beat_fill}, lat_fifo={lat_fill}, "
+                f"incoming={len(incoming)}"
             )
 
-        # Convert back to tensor
-        if not output_frames:
-            output_frames = [incoming[0].frame] if incoming else [np.zeros((H, W, C), dtype=np.uint8)]
-
-        out_np = np.stack(output_frames, axis=0)  # (F, H, W, C)
-        out_tensor = torch.from_numpy(out_np).float() / 255.0  # [0, 1] float
+        # Convert single output frame to tensor
+        out_tensor = torch.from_numpy(output_frame).float().unsqueeze(0) / 255.0  # (1, H, W, C) [0,1]
 
         result = {"video": out_tensor}
 
-        # Diagnostics
+        # Diagnostics metadata
         total = self._decode_success + self._decode_fail
         rate = self._decode_success / total if total > 0 else 0.0
-        if self._latest_decoded_beat >= 0:
-            current_pb = self._playback_cursor if self._playback_cursor >= 0 else int(self._latest_decoded_beat) - beat_hold
-            fill = int(self._latest_decoded_beat) - current_pb
-        else:
-            fill = 0
+        bpm = self._get_effective_bpm()
         result["_bpm_buffer_output_meta"] = {
             "decode_rate": rate,
             "decode_success": self._decode_success,
             "decode_fail": self._decode_fail,
             "buffer_mode": mode,
-            "buffer_size": len(self._beat_buffer) + len(self._loop_frames) + len(self._latency_fifo),
-            "buffer_fill_beats": fill,
+            "beat_fifo_size": len(self._beat_fifo),
+            "latency_fifo_size": len(self._latency_fifo),
             "hold_active": self._hold_active,
-            "auto_loop_active": self._auto_loop_active,
-            "playback_cursor": self._playback_cursor,
+            "extra_delay_ms": self._playback_extra_delay,
+            "effective_bpm": bpm,
             "link_active": self._link_active,
             "link_beat": self._clock.beat if self._clock else None,
             "link_bpm": self._clock.tempo if self._clock else None,
@@ -1116,143 +1091,54 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         return result
 
-    def _process_beat_quantized(
+    def _process_beat(
         self,
         incoming: list[_BufferedFrame],
-        hold_beats: int = 2,
-        auto_loop_beats: int = 4,
-    ) -> list[np.ndarray]:
+        beat_depth: int,
+    ) -> np.ndarray:
         """
-        Beat-quantized mode with CDJ-style hold, auto-loop, and playback cursor.
+        Beat-delayed mode — wall-clock FIFO + binary search.
 
-        Three states:
-        1. HOLD active → freeze at held beat, keep ingesting
-        2. AUTO-LOOP → cycle last N beats when buffer exhausted
-        3. Normal → advance playback cursor or use (latest - depth)
+        All frames are pushed into beat_fifo with their wall-clock timestamp.
+        On each call, we compute:
+            delay_ms = beat_depth × (60000 / bpm) + playback_extra_delay
+            target_time = now - delay_s
+        Then binary search for the closest frame to target_time.
 
-        Between beat boundaries, the last released frame is held frozen
-        (stepped/stutter effect synced to the beat grid).
+        This gives smooth full-framerate playback delayed by exactly N beats.
+        No stepped/stutter behavior — every frame plays in order.
         """
-        self._beat_buffer.extend(incoming)
+        # Ingest: push all incoming frames, hard cap only
+        self._beat_fifo.extend(incoming)
+        while len(self._beat_fifo) > self.MAX_FIFO_FRAMES:
+            self._beat_fifo.pop(0)
 
-        if not self._beat_buffer:
-            return [incoming[-1].frame] if incoming else []
+        if not self._beat_fifo:
+            return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        # Track latest decoded beat
-        if self._link_active and self._clock is not None:
-            latest_beat = self._clock.beat
+        # Compute target time
+        bpm = self._get_effective_bpm()
+        ms_per_beat = 60_000.0 / bpm
+        delay_ms = beat_depth * ms_per_beat + self._playback_extra_delay
+        delay_s = delay_ms / 1000.0
+
+        if self._hold_active and self._hold_target_time > 0:
+            target_time = self._hold_target_time
         else:
-            latest_beat = max(bf.beat for bf in self._beat_buffer)
+            target_time = time.monotonic() - delay_s
 
-        latest_whole = int(latest_beat)
+        # Evict old frames BEFORE search (prevents returning stale data)
+        self._evict_old_frames(self._beat_fifo, target_time, keep_margin=2.0)
 
-        # Advance playback cursor when new beats arrive
-        if latest_whole > int(self._latest_decoded_beat) and self._latest_decoded_beat >= 0:
-            advance = latest_whole - int(self._latest_decoded_beat)
-            if self._playback_cursor >= 0 and advance > 0 and advance < 16:
-                self._playback_cursor += advance
-                # Check if cursor caught up to normal target
-                normal_target = latest_whole - hold_beats
-                if self._playback_cursor >= normal_target:
-                    self._playback_cursor = -1  # resume normal
+        if not self._beat_fifo:
+            return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        self._prev_decoded_beat = self._latest_decoded_beat
-        self._latest_decoded_beat = latest_beat
+        # Binary search for closest frame
+        frame = self._binary_search_closest(self._beat_fifo, target_time)
+        if frame is not None:
+            self._current_output = frame
 
-        # --- HOLD: freeze playback ---
-        if self._hold_active:
-            if self._hold_playhead_beat >= 0:
-                # Find frame at held beat
-                best = None
-                best_dist = float('inf')
-                for bf in self._beat_buffer:
-                    d = abs(bf.beat - self._hold_playhead_beat)
-                    if d < best_dist:
-                        best_dist = d
-                        best = bf
-                if best is not None:
-                    self._last_released_frame = best.frame
-
-            # Don't evict during hold — keep all frames
-            # But cap at 256 to prevent memory blowout
-            if len(self._beat_buffer) > 256:
-                self._beat_buffer = self._beat_buffer[-256:]
-
-            if self._last_released_frame is not None:
-                return [self._last_released_frame]
-            return [self._beat_buffer[-1].frame]
-
-        # --- Compute target beat ---
-        if self._playback_cursor >= 0:
-            target_whole = self._playback_cursor
-        else:
-            target_whole = latest_whole - hold_beats
-
-        # --- AUTO-LOOP: check catchup ---
-        if self._auto_loop_active:
-            # Check if enough new frames arrived to exit
-            available = latest_whole - target_whole
-            if available >= auto_loop_beats:
-                self._auto_loop_active = False
-                self._auto_loop_cursor = -1
-            else:
-                # Advance loop cursor
-                self._auto_loop_cursor += 1
-                loop_len = self._auto_loop_end - self._auto_loop_start
-                if loop_len > 0 and (self._auto_loop_cursor - self._auto_loop_start) >= loop_len:
-                    self._auto_loop_cursor = self._auto_loop_start
-
-                # Find frame at loop cursor position
-                best = None
-                best_dist = float('inf')
-                for bf in self._beat_buffer:
-                    d = abs(bf.beat - self._auto_loop_cursor)
-                    if d < best_dist:
-                        best_dist = d
-                        best = bf
-                if best is not None:
-                    self._last_released_frame = best.frame
-
-                if self._last_released_frame is not None:
-                    return [self._last_released_frame]
-                return [self._beat_buffer[-1].frame]
-
-        # --- Normal playback ---
-        if target_whole > self._last_released_beat:
-            # New beat boundary
-            target_f = float(target_whole)
-            best = min(self._beat_buffer, key=lambda bf: abs(bf.beat - target_f))
-            self._last_released_frame = best.frame
-            self._last_released_beat = target_whole
-        elif target_whole < self._last_released_beat and not self._beat_buffer:
-            # No frames at target — check if we should auto-loop
-            pass
-
-        # Check if buffer exhausted (playback caught up to live)
-        available = latest_whole - target_whole
-        if available <= 0 and len(self._beat_buffer) >= 2 and not self._auto_loop_active:
-            self._auto_loop_active = True
-            self._auto_loop_end = target_whole
-            self._auto_loop_start = target_whole - auto_loop_beats
-            self._auto_loop_cursor = self._auto_loop_start
-            logger.info(
-                f"[BPM Buffer Output] Auto-loop engaged: "
-                f"beats {self._auto_loop_start}-{self._auto_loop_end}"
-            )
-
-        # Evict old frames — keep frames from earliest needed position
-        earliest = min(target_whole, self._auto_loop_start if self._auto_loop_active else target_whole)
-        self._beat_buffer = [
-            bf for bf in self._beat_buffer
-            if bf.beat >= earliest - 2
-        ]
-        # Hard cap
-        if len(self._beat_buffer) > 256:
-            self._beat_buffer = self._beat_buffer[-256:]
-
-        if self._last_released_frame is not None:
-            return [self._last_released_frame]
-        return [self._beat_buffer[-1].frame]
+        return self._current_output if self._current_output is not None else incoming[-1].frame
 
     def _process_loop(
         self, incoming: list[_BufferedFrame], loop_length_beats: int
@@ -1302,33 +1188,39 @@ class BpmTimecodeStripPipeline(Pipeline):
 
     def _process_latency(
         self, incoming: list[_BufferedFrame], delay_ms: int
-    ) -> list[np.ndarray]:
+    ) -> np.ndarray:
         """
-        Latency compensation mode: FIFO buffer with configurable delay.
-        Smooths out variable inference latency for consistent output timing.
+        Latency compensation mode — wall-clock FIFO + binary search.
+
+        Same architecture as beat mode but with a direct ms delay parameter.
+        Sliding the delay shorter → playback speeds up to catch up.
+        Sliding the delay longer → playback slows until buffer fills.
+        This emergent behavior from continuous slider + binary search is
+        smooth and expressive — perfect for MIDI fader control.
+
+        delay_ms range: 0-60000 (0 to 60 seconds)
         """
+        # Ingest: push all incoming frames, hard cap only
         self._latency_fifo.extend(incoming)
+        while len(self._latency_fifo) > self.MAX_FIFO_FRAMES:
+            self._latency_fifo.pop(0)
 
-        # Calculate how many frames the delay corresponds to
-        # Use latest BPM to estimate frame rate (Scope typically runs ~30fps)
-        fps_estimate = 30.0
-        delay_frames = max(1, int((delay_ms / 1000.0) * fps_estimate))
+        if not self._latency_fifo:
+            return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        output = []
-        while len(self._latency_fifo) > delay_frames:
-            bf = self._latency_fifo.pop(0)
-            output.append(bf.frame)
+        # Compute target time
+        delay_s = delay_ms / 1000.0
+        target_time = time.monotonic() - delay_s
 
-        if not output:
-            # Buffer not full yet — output oldest available
-            if self._latency_fifo:
-                output.append(self._latency_fifo[0].frame)
-            else:
-                output.append(incoming[-1].frame)
+        # Evict old frames BEFORE search
+        self._evict_old_frames(self._latency_fifo, target_time, keep_margin=2.0)
 
-        # Cap FIFO size to prevent memory growth
-        max_fifo = delay_frames * 3
-        if len(self._latency_fifo) > max_fifo:
-            self._latency_fifo = self._latency_fifo[-delay_frames:]
+        if not self._latency_fifo:
+            return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        return output
+        # Binary search for closest frame
+        frame = self._binary_search_closest(self._latency_fifo, target_time)
+        if frame is not None:
+            self._current_output = frame
+
+        return self._current_output if self._current_output is not None else incoming[-1].frame
